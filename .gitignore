@@ -1,0 +1,7 @@
+node_modules/
+dist/
+public/ort/
+public/pyodide/
+work/
+.sites-runtime/
+*.log
