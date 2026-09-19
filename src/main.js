@@ -329,6 +329,7 @@ const refs = {
 let sourceImage = null;
 let sourceImageDataUrl = null;
 let sourceImageName = '';
+let imageLoadPromise = null;
 let worker = null;
 let executionTimer = null;
 let running = false;
@@ -797,6 +798,7 @@ function stopExecution(reason = '手動で実行を停止しました。') {
 async function runCode() {
   if (running) return;
   if (syntaxDiagnostics(editorView).length) { finishWithError('Pythonコードに書式エラーがあります。エディター内の赤い印を確認してください。'); editorView.focus(); return; }
+  if (imageLoadPromise) await imageLoadPromise;
   if (cameraStream) {
     try { await captureCameraFrame(); } catch (error) { finishWithError(error.message); return; }
   }
@@ -928,8 +930,8 @@ $('#new-file').addEventListener('click', openNewFileDialog);
 $('#file-confirm').addEventListener('click', confirmFileDialog); $('#file-duplicate').addEventListener('click', duplicateFileDialog); $('#file-delete').addEventListener('click', deleteFileDialog);
 $('#file-name-input').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); confirmFileDialog(); } });
 $('#sample-select').addEventListener('change', event => { setCode(samples[event.target.value]); scheduleAutosave(); editorView.focus(); });
-refs.imageFile.addEventListener('change', async event => { try { await loadImageFile(event.target.files[0]); } catch(error){finishWithError(error.message);} });
-$('#sample-image').addEventListener('click', loadSampleImage);
+refs.imageFile.addEventListener('change', event => { imageLoadPromise=loadImageFile(event.target.files[0]).catch(error=>finishWithError(error.message)).finally(()=>{imageLoadPromise=null;}); });
+$('#sample-image').addEventListener('click', () => { imageLoadPromise=loadSampleImage().finally(()=>{imageLoadPromise=null;}); });
 $('#camera-toggle').addEventListener('click', toggleCamera);
 refs.run.addEventListener('click', runCode); refs.stop.addEventListener('click', () => stopExecution());
 $('#clear-log').addEventListener('click', () => { refs.terminal.innerHTML=''; addLog('system','ログを消去しました。'); });
