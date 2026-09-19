@@ -532,10 +532,16 @@ self.onmessage = async event => {
     const runtime = await ensurePython();
     self.bridge = buildBridge(); runtime.globals.set('bridge', self.bridge);
     await runtime.runPythonAsync(PYTHON_BOOTSTRAP);
+    for (const file of payload.files || []) {
+      if (!/^[A-Za-z0-9_.-]+\.py$/.test(file.name)) continue;
+      runtime.FS.writeFile(`/${file.name}`, String(file.code || ''), { encoding: 'utf8' });
+      const moduleName = file.name.replace(/\.py$/, '');
+      await runtime.runPythonAsync(`import sys\nsys.modules.pop(${JSON.stringify(moduleName)}, None)`);
+    }
     post('status', { phase: 'executing', text: 'コードを実行しています' });
     const { prepared, limited } = prepareCode(payload.code);
     if (limited) post('log',{level:'system',text:'固定画像モードのため while(True) を1フレームだけ実行します。',time:stamp()});
-    await runtime.runPythonAsync(prepared, { filename: 'main.py' });
+    await runtime.runPythonAsync(prepared, { filename: payload.filename || 'main.py' });
     const frame = latestFrame || sourceFrame;
     post('result', { width:frame.width,height:frame.height,data:frame.data.buffer,gpio,leds:ledState }, [frame.data.buffer]);
   } catch (error) {

@@ -1,7 +1,9 @@
 node_modules/
+.npm-cache/
 dist/
 public/ort/
 public/pyodide/
 work/
+outputs/
 .sites-runtime/
 *.log
