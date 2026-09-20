@@ -353,7 +353,12 @@ export default {
     try {
       const url = new URL(request.url);
       if (url.pathname.startsWith('/api/github/')) return await handleApi(request, env);
-      if (env.ASSETS?.fetch) return env.ASSETS.fetch(request);
+      if (env.ASSETS?.fetch) {
+        const response = await env.ASSETS.fetch(request);
+        const headers = new Headers(response.headers);
+        headers.set('Permissions-Policy', 'serial=(self)');
+        return new Response(response.body, { status:response.status, statusText:response.statusText, headers });
+      }
       return new Response('Not found', { status: 404 });
     } catch (error) {
       console.error(JSON.stringify({ event: 'github_worker_error', message: error instanceof Error ? error.message : String(error) }));

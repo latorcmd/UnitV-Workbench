@@ -9,6 +9,9 @@ import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { tags } from '@lezer/highlight';
 import { MergeView } from '@codemirror/merge';
 import { unzipSync } from 'fflate';
+import { LatestBranchLoader } from './github-branch-loader.js';
+import { MaixPyIdeClient } from './maixpy-ide.js';
+import { WebSerialTransport } from './serial-transport.js';
 import {
   createEntry, createProject, deleteProject, listProjectEntries, listProjects,
   removeEntry, replaceProjectEntries, saveEntries, saveEntry, saveProjectRecord
@@ -54,6 +57,11 @@ document.querySelector('#app').innerHTML = `
       <button class="sample-image-button camera-button" id="camera-toggle" type="button">カメラを開始</button>
       <button class="sample-image-button" id="threshold-open" type="button" disabled>LAB閾値</button>
       <div class="control-divider"></div>
+      <div class="execution-target">
+        <label><span>実行先</span><select id="execution-target"><option value="simulator">ブラウザ</option><option value="unitv">実機 UnitV</option></select></label>
+        <button class="sample-image-button" id="unitv-connect" type="button">実機接続</button>
+        <small id="unitv-connection">未接続</small>
+      </div>
       <div class="run-copy"><span class="step">02</span><span><strong>コードを実行</strong><small id="execution-limit-note">静止画像は実行上限 8秒</small></span></div>
       <button class="run-button" id="run" type="button"><span>▶</span> 実行</button>
       <button class="stop-button" id="stop" type="button" disabled>■ 停止</button>
@@ -82,7 +90,7 @@ document.querySelector('#app').innerHTML = `
               <img id="asset-image" alt="選択した画像">
               <div><strong id="asset-name"></strong><small id="asset-meta"></small><button id="asset-to-frame" type="button">フレームバッファに適用</button></div>
             </div>
-            <div id="binary-viewer" class="binary-viewer" hidden><strong>プレビューできないファイルです</strong><small id="binary-meta"></small></div>
+            <div id="binary-viewer" class="binary-viewer" hidden><strong>プレビューできないファイルです</strong><small id="binary-meta"></small><button id="binary-download" type="button" disabled>ファイルをダウンロード</button></div>
             <div class="editor-status"><span id="syntax-status">構文チェック中…</span><span id="save-status">ローカル保存</span><span>Ctrl / ⌘ + Enter で実行</span></div>
           </div>
         </div>
@@ -106,7 +114,7 @@ document.querySelector('#app').innerHTML = `
         <article class="panel serial-panel">
           <div class="panel-head">
             <div><span class="panel-kicker blue">SERIAL MONITOR</span><h2>シリアルモニタ</h2></div>
-            <div class="panel-tools"><button id="clear-log" type="button">消去</button><span>115200 baud</span></div>
+            <div class="panel-tools"><button id="clear-log" type="button">消去</button><span id="serial-baud">仮想UART · 115200 baud</span></div>
           </div>
           <div class="terminal" id="terminal" role="log" aria-live="polite"></div>
         </article>
@@ -116,7 +124,7 @@ document.querySelector('#app').innerHTML = `
     <section class="io-dock panel">
       <div class="io-header">
         <div class="io-title"><span class="panel-kicker">DEVICE BAY</span><h2>仮想デバイス</h2></div>
-        <span class="device-note">GPIO1 / GPIO2は実機のButton A / Bに対応</span>
+        <span class="device-note" id="device-note">GPIO1 / GPIO2は実機のButton A / Bに対応</span>
       </div>
       <div class="device-pane active" id="io-pane" role="tabpanel">
         <div class="uart-field"><label for="uart-input">UART RX</label><input id="uart-input" value="hello UnitV\\n" /><select id="uart-format" aria-label="UART入力形式"><option value="text">TEXT</option><option value="hex">HEX</option></select><button id="uart-queue" type="button">受信キューへ</button></div>
@@ -139,7 +147,7 @@ document.querySelector('#app').innerHTML = `
 
   <dialog id="save-dialog" class="dialog small-dialog">
     <form method="dialog"><div class="dialog-head"><div><span class="panel-kicker">PROJECT FILE</span><h2>プロジェクトを保存</h2></div><button value="close" aria-label="閉じる">×</button></div>
-      <label class="check-row"><input id="embed-image" type="checkbox" checked><span><strong>入力画像を含める</strong><small>別の端末でも同じ状態から再開できます</small></span></label>
+      <label class="check-row"><input id="embed-image" type="checkbox" checked><span><strong>画像・バイナリを含める</strong><small>JPGやkmodelも含め、別の端末で同じ状態から再開できます</small></span></label>
       <div class="dialog-actions"><button value="close" class="ghost-button">キャンセル</button><button type="button" class="run-button" id="confirm-save">ダウンロード</button></div>
     </form>
   </dialog>
@@ -256,7 +264,8 @@ const $ = selector => document.querySelector(selector);
 const refs = {
   editor: $('#code-editor'), imageFile: $('#image-file'), canvas: $('#output-canvas'), empty: $('#empty-frame'), camera: $('#camera-preview'),
   imageLabel: $('#image-label'), imageDetail: $('#image-detail'), frameMeta: $('#frame-meta'), terminal: $('#terminal'),
-  run: $('#run'), stop: $('#stop'), runtime: $('#runtime-state'), uart: $('#uart-input'), uartFormat: $('#uart-format')
+  run: $('#run'), stop: $('#stop'), runtime: $('#runtime-state'), uart: $('#uart-input'), uartFormat: $('#uart-format'),
+  executionTarget: $('#execution-target'), unitvConnect: $('#unitv-connect'), unitvConnection: $('#unitv-connection')
 };
 
 let sourceImage = null;
@@ -301,6 +310,15 @@ let githubAuthBusy = false;
 let githubPollGeneration = 0;
 let githubPendingCommit = null;
 let githubBranches = [];
+let githubBranchBusy = false;
+const githubBranchLoader = new LatestBranchLoader();
+const serialTransport = new WebSerialTransport();
+const realUnitV = new MaixPyIdeClient(serialTransport);
+let executionTarget = localStorage.getItem('unitv-execution-target') === 'unitv' ? 'unitv' : 'simulator';
+let realPollGeneration = 0;
+let realConnectionBusy = false;
+let realStdoutBuffer = '';
+const realStdoutDecoder = new TextDecoder();
 
 const languageCompartment = new Compartment();
 const lintCompartment = new Compartment();
@@ -415,11 +433,45 @@ function setRuntime(state, detail, mode = '') {
 function setRunning(value) {
   running = value; refs.run.disabled = value || !isPythonEntry(activeEntry()); refs.stop.disabled = !value;
   refs.run.innerHTML = value ? '<span class="spinner"></span> 実行中' : '<span>▶</span> 実行';
+  refs.executionTarget.disabled = value;
+  refs.unitvConnect.disabled = value || realConnectionBusy || !serialTransport.supported;
 }
 
 function downloadBlob(blob, name) {
   const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function renderExecutionTarget() {
+  const real = executionTarget === 'unitv';
+  refs.executionTarget.value = executionTarget;
+  document.querySelector('#io-pane').classList.toggle('hardware-disabled', real);
+  document.querySelectorAll('#io-pane input, #io-pane select, #io-pane button, #io-pane [data-gpio]').forEach(control => { control.disabled = real; });
+  $('#device-note').textContent = real ? '実機実行中は仮想UART・GPIO・WS2812を使用しません' : 'GPIO1 / GPIO2は実機のButton A / Bに対応';
+  $('#serial-baud').textContent = real ? (realUnitV.ideReady ? '実機 · 1500000 baud' : '実機 · 115200 baud') : '仮想UART · 115200 baud';
+  $('#execution-limit-note').textContent = real ? '実機では停止まで連続実行' : cameraStream ? 'カメラ時は停止まで連続実行' : '静止画像は実行上限 8秒';
+  refs.unitvConnect.hidden = !real;
+  refs.unitvConnection.hidden = !real;
+  refs.run.title = real ? '選択中のPythonを実機UnitVで実行' : '選択中のPythonをブラウザ内で実行';
+  if (real) {
+    refs.imageLabel.textContent = sourceImageName || '実機カメラを使用';
+    refs.imageDetail.textContent = '画像入力はUnitVのsensor.snapshot()から取得';
+  } else if (sourceImage) {
+    refs.imageLabel.textContent = sourceImageName || '入力画像';
+    refs.imageDetail.textContent = `${sourceImage.width} × ${sourceImage.height}・ブラウザ内で使用`;
+  } else {
+    refs.imageLabel.textContent = '入力画像'; refs.imageDetail.textContent = 'PNG / JPG / WebP・最大15 MB';
+  }
+  renderUnitVConnection();
+}
+
+function renderUnitVConnection(message = '') {
+  const connected = serialTransport.connected;
+  refs.unitvConnect.textContent = connected ? '切断' : '実機接続';
+  refs.unitvConnect.disabled = running || realConnectionBusy || !serialTransport.supported;
+  refs.unitvConnection.textContent = message || (connected ? (realUnitV.ideReady ? 'IDEモード接続中' : 'USB接続中') : serialTransport.supported ? '未接続' : 'Chrome / Edgeのみ対応');
+  refs.unitvConnection.classList.toggle('connected', connected);
+  if (executionTarget === 'unitv') $('#serial-baud').textContent = realUnitV.ideReady ? '実機 · 1500000 baud' : '実機 · 115200 baud';
 }
 
 function normalizeProjectPath(value, fallback = 'untitled.py') {
@@ -577,6 +629,7 @@ async function selectFile(id) {
   refs.editor.hidden = file.kind !== 'text';
   $('#asset-viewer').hidden = file.kind !== 'image';
   $('#binary-viewer').hidden = !['binary', 'submodule'].includes(file.kind);
+  $('#binary-download').disabled = file.kind !== 'binary' || !file.blob;
   if (file.kind === 'text') {
     suppressAutosave = true; setCode(file.text || ''); suppressAutosave = false;
     configureEditorForEntry(file); editorView.focus();
@@ -586,7 +639,8 @@ async function selectFile(id) {
     $('#asset-meta').textContent = `${file.mime || 'image'} · ${(file.size / 1024).toFixed(1)} KB`;
     updateSyntaxStatus();
   } else {
-    $('#binary-meta').textContent = `${file.path} · ${file.size || 0} bytes${file.kind === 'submodule' ? ' · submodule' : ''}`;
+    const extension = file.path.split('.').pop()?.toLowerCase();
+    $('#binary-meta').textContent = `${file.path} · ${file.size || 0} bytes${file.kind === 'submodule' ? ' · submodule' : extension === 'kmodel' ? ' · K210 kmodel（読み取り専用）' : ' · 読み取り専用'}`;
     updateSyntaxStatus();
   }
   $('#active-file-name').textContent = file.path;
@@ -1040,9 +1094,116 @@ function finishWithError(message) {
   addLog('error', message);
 }
 
-function stopExecution(reason = '手動で実行を停止しました。') {
+function flushRealStdout(final = false) {
+  if (final) realStdoutBuffer += realStdoutDecoder.decode();
+  if (final) {
+    if (realStdoutBuffer) addLog('stdout', realStdoutBuffer);
+    realStdoutBuffer = '';
+    return;
+  }
+  const lines = realStdoutBuffer.split(/\r\n|\n|\r/);
+  realStdoutBuffer = lines.pop() || '';
+  lines.forEach(line => addLog('stdout', line));
+}
+
+function appendRealStdout(bytes) {
+  if (!bytes?.byteLength) return;
+  realStdoutBuffer += realStdoutDecoder.decode(bytes, { stream:true });
+  flushRealStdout(false);
+}
+
+async function drawRealFrame(frame) {
+  const bitmap = await createImageBitmap(new Blob([frame.jpeg], { type:'image/jpeg' }));
+  refs.canvas.width = bitmap.width;
+  refs.canvas.height = bitmap.height;
+  const context = refs.canvas.getContext('2d', { willReadFrequently:true });
+  context.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  frameBufferImage = context.getImageData(0, 0, refs.canvas.width, refs.canvas.height);
+  refs.canvas.hidden = false; refs.camera.hidden = true; refs.empty.hidden = true;
+  refs.frameMeta.textContent = `${refs.canvas.width} × ${refs.canvas.height} LIVE UNITV`;
+  $('#download-image').disabled = false; $('#threshold-open').disabled = false;
+}
+
+async function connectUnitV() {
+  if (realConnectionBusy || running) return;
+  if (serialTransport.connected) { await disconnectUnitV(); return; }
+  realConnectionBusy = true; renderUnitVConnection('接続先を選択してください…');
+  try {
+    await realUnitV.connectConsole();
+    renderUnitVConnection();
+    setRuntime('UnitV接続', '実行するとIDEモードへ切り替えます', 'success');
+    addLog('system', 'UnitVへUSB接続しました（115200 baud）。');
+  } catch (error) {
+    try { await serialTransport.close(); } catch { /* connection never fully opened */ }
+    renderUnitVConnection('接続できません');
+    finishWithError(`UnitVへ接続できません: ${error.message}`);
+  } finally {
+    realConnectionBusy = false; renderUnitVConnection();
+  }
+}
+
+async function disconnectUnitV({ unexpected = false } = {}) {
+  ++realPollGeneration;
+  realConnectionBusy = true;
+  if (running && executionTarget === 'unitv') setRunning(false);
+  renderUnitVConnection(unexpected ? '接続が切れました' : '切断処理中…');
+  try {
+    if (unexpected) await serialTransport.close();
+    else await realUnitV.resetAndClose();
+  } catch (error) {
+    if (!unexpected) addLog('warning', `切断処理の一部を完了できませんでした: ${error.message}`);
+  } finally {
+    realConnectionBusy = false; realUnitV.ideReady = false; renderUnitVConnection(unexpected ? '再起動後に再接続してください' : '未接続');
+  }
+  if (unexpected) {
+    setRuntime('UnitV切断', '本体をリセットしてから再接続してください', 'error');
+    addLog('error', 'UnitVとのUSB接続が切れました。本体をリセットしてから再接続してください。');
+  } else {
+    setRuntime('UnitV切断', '実機をリセットして安全に切断しました');
+    addLog('system', 'UnitVの実行を停止・リセットして切断しました。');
+  }
+}
+
+async function runOnUnitV(activeFile) {
+  if (!serialTransport.connected) { finishWithError('「実機接続」を押してUnitVを選択してください。'); refs.unitvConnect.focus(); return; }
+  await persistCurrentFile();
+  setRunning(true); realStdoutBuffer = '';
+  const generation = ++realPollGeneration;
+  setRuntime('UnitV準備中', 'MaixPy IDEモードへ切り替えています', 'busy'); addLog('system', `実機で実行します: ${activeFile.path}`);
+  try {
+    await realUnitV.activateIde(); renderUnitVConnection();
+    await realUnitV.setFrameBufferEnabled(true);
+    await realUnitV.execute(getCode());
+    setRuntime('実機で実行中', '停止ボタンを押すまでUnitV上で動作します', 'busy');
+    let observedRunning = false;
+    let idlePolls = 0;
+    while (running && generation === realPollGeneration) {
+      const result = await realUnitV.poll();
+      appendRealStdout(result.stdout);
+      if (result.frame && generation === realPollGeneration) await drawRealFrame(result.frame);
+      if (result.running) { observedRunning = true; idlePolls = 0; }
+      else idlePolls += 1;
+      if ((observedRunning && !result.running) || (!observedRunning && idlePolls >= 3)) break;
+      await sleep(70);
+    }
+    if (generation !== realPollGeneration) return;
+    flushRealStdout(true); setRunning(false);
+    setRuntime('実機実行完了', 'UnitVから最終結果を取得しました', 'success'); addLog('system', 'UnitVでの実行が完了しました。');
+  } catch (error) {
+    if (generation === realPollGeneration) finishWithError(`UnitV実行エラー: ${error.message}`);
+  }
+}
+
+async function stopExecution(reason = '手動で実行を停止しました。') {
   if (!running) return;
-  clearTimeout(executionTimer); executionTimer = null; worker?.terminate(); worker = null; setRunning(false);
+  clearTimeout(executionTimer); executionTimer = null;
+  if (executionTarget === 'unitv') {
+    ++realPollGeneration;
+    try { await realUnitV.stop(); } catch (error) { addLog('warning', `UnitVへ停止命令を送れませんでした: ${error.message}`); }
+    flushRealStdout(true);
+  } else { worker?.terminate(); worker = null; }
+  setRunning(false);
   setRuntime('停止', '次回実行時に環境を再起動します', 'error'); addLog('warning', reason);
 }
 
@@ -1051,6 +1212,7 @@ async function runCode() {
   const activeFile = activeEntry();
   if (!isPythonEntry(activeFile)) { finishWithError('実行するPythonファイルを選択してください。'); return; }
   if (syntaxDiagnostics(editorView).length) { finishWithError('Pythonコードに書式エラーがあります。エディター内の赤い印を確認してください。'); editorView.focus(); return; }
+  if (executionTarget === 'unitv') { await runOnUnitV(activeFile); return; }
   if (imageLoadPromise) await imageLoadPromise;
   if (cameraStream) {
     try { await captureCameraFrame(); } catch (error) { finishWithError(error.message); return; }
@@ -1087,31 +1249,31 @@ function base64ToArrayBuffer(value) {
 
 async function saveProject() {
   await persistCurrentFile();
-  const embedImages = $('#embed-image').checked;
+  const embedAssets = $('#embed-image').checked;
   const entries = await Promise.all(files.filter(entry => !entry.deleted).map(async entry => ({
     path:entry.path, kind:entry.kind, text:entry.kind === 'text' ? entry.text : undefined,
-    dataUrl:entry.kind === 'image' && embedImages && entry.blob ? await fileToDataUrl(entry.blob) : undefined,
+    dataUrl:['image','binary'].includes(entry.kind) && embedAssets && entry.blob ? await fileToDataUrl(entry.blob) : undefined,
     mime:entry.mime, size:entry.size, mode:entry.mode, basePath:entry.basePath, baseSha:entry.baseSha,
     baseText:entry.kind === 'text' ? entry.baseText : undefined
   })));
   const source = currentProject.source?.type === 'github' ? { ...currentProject.source, pendingCommit:undefined } : { type:'local' };
-  const project = { version:3, app:'UnitV Browser Lab', name:currentProject.name, savedAt:new Date().toISOString(), activePath:activeEntry()?.path, source, entries, uart:{value:refs.uart.value,format:refs.uartFormat.value}, gpio:{...gpioState}, image:{name:sourceImageName} };
+  const project = { version:4, app:'UnitV Browser Lab', name:currentProject.name, savedAt:new Date().toISOString(), activePath:activeEntry()?.path, source, entries, uart:{value:refs.uart.value,format:refs.uartFormat.value}, gpio:{...gpioState}, image:{name:sourceImageName} };
   if ($('#embed-image').checked && sourceImageDataUrl) project.image.dataUrl=sourceImageDataUrl;
   const safeName = currentProject.name.replace(/[\\/:*?"<>|]/g, '-');
   downloadBlob(new Blob([JSON.stringify(project,null,2)],{type:'application/json'}), `${safeName}.unitvproj`); $('#save-dialog').close(); addLog('system','プロジェクトを書き出しました。');
 }
 
 async function openProject(file) {
-  if (file.size > 70 * 1024 * 1024) throw new Error('プロジェクトファイルが大きすぎます。');
-  const data=JSON.parse(await file.text()); if(![1,2,3].includes(data.version)) throw new Error(`未対応のプロジェクトバージョンです: ${data.version}`);
-  const reusableGithubSource = data.version === 3 && data.source?.type === 'github' && data.source.owner && data.source.repo && data.source.branch && data.source.headSha;
+  if (file.size > 80 * 1024 * 1024) throw new Error('プロジェクトファイルが大きすぎます。');
+  const data=JSON.parse(await file.text()); if(![1,2,3,4].includes(data.version)) throw new Error(`未対応のプロジェクトバージョンです: ${data.version}`);
+  const reusableGithubSource = data.version >= 3 && data.source?.type === 'github' && data.source.owner && data.source.repo && data.source.branch && data.source.headSha;
   const importedProject=createProject(uniqueProjectName(data.name || file.name.replace(/\.unitvproj$/i,'')), reusableGithubSource ? data.source : {type:'local'});
-  const rawEntries = data.version === 3 && Array.isArray(data.entries) ? data.entries : data.version === 2 && Array.isArray(data.files) ? data.files.map(item=>({path:item.name,kind:'text',text:item.code})) : [{path:'main.py',kind:'text',text:String(data.code||'')}];
+  const rawEntries = data.version >= 3 && Array.isArray(data.entries) ? data.entries : data.version === 2 && Array.isArray(data.files) ? data.files.map(item=>({path:item.name,kind:'text',text:item.code})) : [{path:'main.py',kind:'text',text:String(data.code||'')}];
   if (rawEntries.length > MAX_PROJECT_ENTRIES) throw new Error(`ファイル数が上限の${MAX_PROJECT_ENTRIES}件を超えています。`);
   const imported=[]; let importedBytes=0;
   for (const [index,item] of rawEntries.entries()) {
     const path=normalizeProjectPath(item.path || `file-${index+1}.txt`);
-    let blob=null; if(item.kind==='image' && item.dataUrl) blob=await (await fetch(item.dataUrl)).blob();
+    let blob=null; if(['image','binary'].includes(item.kind) && item.dataUrl) blob=await (await fetch(item.dataUrl)).blob();
     const text=String(item.text||''); const size=item.kind === 'text' || !item.kind ? new Blob([text]).size : blob?.size || Number(item.size) || 0;
     if ((item.kind === 'text' || !item.kind) && size > MAX_TEXT_BYTES) throw new Error(`${path} はテキスト上限の1 MBを超えています。`);
     if (item.kind === 'image' && size > MAX_IMAGE_BYTES) throw new Error(`${path} は画像上限の15 MBを超えています。`);
@@ -1222,14 +1384,17 @@ function renderGithubAccount() {
   }
 }
 
-function renderGithubRepositories(preferredFullName = '') {
+async function renderGithubRepositories(preferredFullName = '') {
   const select = $('#github-repository');
   const current = preferredFullName || `${$('#github-owner').value}/${$('#github-repo').value}`;
   select.replaceChildren();
   if (!githubRepositories.length) {
+    githubBranchLoader.invalidate(); githubBranchBusy = false; githubBranches = [];
     const option = document.createElement('option');
     option.value = ''; option.textContent = githubAccount ? '許可済みリポジトリがありません' : 'ログインすると選択できます';
     select.append(option); select.disabled = true; $('#github-owner').value = ''; $('#github-repo').value = '';
+    const branchSelect = $('#github-branch'); branchSelect.replaceChildren(new Option('リポジトリを選択してください', '')); branchSelect.disabled = true;
+    setGithubControlsBusy(false);
     return;
   }
   githubRepositories.forEach(repository => {
@@ -1240,7 +1405,7 @@ function renderGithubRepositories(preferredFullName = '') {
   const preferred = githubRepositories.find(repository => repository.fullName === current);
   const selected = preferred || githubRepositories[0];
   select.value = selected.fullName; select.disabled = false;
-  void applyGithubRepository(selected, !preferred);
+  await applyGithubRepository(selected, !preferred);
 }
 
 async function applyGithubRepository(repository, useDefaultBranch = true) {
@@ -1248,10 +1413,13 @@ async function applyGithubRepository(repository, useDefaultBranch = true) {
   $('#github-owner').value = repository.owner;
   $('#github-repo').value = repository.name;
   const branchSelect = $('#github-branch'); const previous = branchSelect.value;
-  branchSelect.disabled = true; branchSelect.replaceChildren(new Option('ブランチを取得中…', ''));
+  githubBranchBusy = true; branchSelect.disabled = true; branchSelect.replaceChildren(new Option('ブランチを取得中…', '')); setGithubControlsBusy(false);
+  const base = `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}`;
+  const result = await githubBranchLoader.load(repository, () => githubRequest(`${base}/branches?per_page=100`));
+  if (result.stale) return;
   try {
-    const base = `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}`;
-    githubBranches = await githubRequest(`${base}/branches?per_page=100`);
+    if (result.error) throw result.error;
+    githubBranches = result.branches;
     branchSelect.replaceChildren(); githubBranches.forEach(branch => branchSelect.append(new Option(branch.name, branch.name)));
     const saved = JSON.parse(localStorage.getItem('unitv-github-settings') || '{}');
     const linked = currentProject?.source?.type === 'github' && currentProject.source.owner === repository.owner && currentProject.source.repo === repository.name;
@@ -1259,7 +1427,11 @@ async function applyGithubRepository(repository, useDefaultBranch = true) {
     branchSelect.value = githubBranches.some(branch => branch.name === preferred) ? preferred : githubBranches[0]?.name || '';
     branchSelect.disabled = !githubBranches.length;
   } catch (error) {
+    githubBranches = [];
     branchSelect.replaceChildren(new Option('ブランチを取得できません', '')); githubSetStatus(error.message, 'error');
+  } finally {
+    githubBranchBusy = false;
+    setGithubControlsBusy(false);
   }
   saveGithubSettings(githubSettings()); renderGithubState();
 }
@@ -1273,14 +1445,14 @@ async function refreshGithubSession({ quiet = false } = {}) {
     $('#github-install').href = data.installUrl || 'https://github.com/apps/unitv-browser-lab/installations/new';
     const saved = JSON.parse(localStorage.getItem('unitv-github-settings') || '{}');
     const linked = currentProject?.source?.type === 'github' ? `${currentProject.source.owner}/${currentProject.source.repo}` : '';
-    renderGithubRepositories(linked || (saved.owner && saved.repo ? `${saved.owner}/${saved.repo}` : ''));
+    await renderGithubRepositories(linked || (saved.owner && saved.repo ? `${saved.owner}/${saved.repo}` : ''));
     renderGithubAccount();
     githubSetStatus(githubRepositories.length
       ? 'ログインしました。利用するリポジトリを選択してください。'
       : 'ログインしました。「権限を設定」から利用するリポジトリを選んでください。', githubRepositories.length ? 'success' : 'busy');
     return true;
   } catch (error) {
-    githubAccount = null; githubRepositories = []; renderGithubRepositories(); renderGithubAccount();
+    githubAccount = null; githubRepositories = []; await renderGithubRepositories(); renderGithubAccount();
     if (!quiet && error.status !== 401) githubSetStatus(error.message, 'error');
     else if (!quiet) githubSetStatus('GitHubでログインしてください。');
     return false;
@@ -1332,7 +1504,7 @@ async function logoutGithub() {
   await runGithubAction('GitHubからログアウト中…', async () => {
     await githubApi('/api/github/logout', { method: 'POST' });
     githubAccount = null; githubRepositories = []; $('#github-device').hidden = true;
-    renderGithubRepositories(); renderGithubAccount();
+    await renderGithubRepositories(); renderGithubAccount();
     githubSetStatus('ログアウトしました。', 'success');
   });
 }
@@ -1342,6 +1514,7 @@ function githubSetStatus(message, mode = '') {
 }
 
 function setGithubControlsBusy(busy) {
+  busy = busy || githubBranchBusy;
   const connected = Boolean(githubAccount && $('#github-owner').value && $('#github-repo').value);
   $('#github-clone').disabled = busy || !connected || !$('#github-branch').value;
   const linked = Boolean(githubAccount && currentProject?.source?.type === 'github');
@@ -1454,7 +1627,7 @@ async function fetchRepositorySnapshot(settings) {
       try { const decoded = new TextDecoder('utf-8', { fatal:true }).decode(bytes); if (!decoded.includes('\0')) text = decoded; } catch { /* read-only binary */ }
     }
     if (text !== null) entries.push({ path, kind:'text', text, size:bytes.byteLength, mode:item.mode, basePath:path, baseSha:item.sha, baseText:text, order });
-    else entries.push({ path, kind:'binary', size:bytes.byteLength, mode:item.mode, basePath:path, baseSha:item.sha, order });
+    else entries.push({ path, kind:'binary', blob:new Blob([bytes], { type:'application/octet-stream' }), mime:'application/octet-stream', size:bytes.byteLength, mode:item.mode, basePath:path, baseSha:item.sha, order });
   }
   return { entries, headSha:reference.object.sha, treeSha:commit.tree.sha };
 }
@@ -1646,10 +1819,20 @@ $('#editor-fullscreen').addEventListener('click', toggleEditorFullscreen); $('#d
 $('#diff-select-all').addEventListener('click', () => { const changes = changedEntries(); const allSelected = changes.every(entry => selectedChanges.has(entry.id)); changes.forEach(entry => allSelected ? selectedChanges.delete(entry.id) : selectedChanges.add(entry.id)); renderDiffList(); });
 $('#diff-dialog').addEventListener('close', destroyMergeView);
 $('#asset-to-frame').addEventListener('click', () => { const entry = activeEntry(); if (!entry?.blob) return; imageLoadPromise = loadImageFile(new File([entry.blob], entry.path, { type:entry.mime || entry.blob.type })).catch(error => finishWithError(error.message)).finally(() => { imageLoadPromise = null; }); });
+$('#binary-download').addEventListener('click', () => { const entry = activeEntry(); if (entry?.kind === 'binary' && entry.blob) downloadBlob(entry.blob, entry.path.split('/').pop()); });
 refs.imageFile.addEventListener('change', event => { imageLoadPromise=loadImageFile(event.target.files[0]).catch(error=>finishWithError(error.message)).finally(()=>{imageLoadPromise=null;}); });
 $('#sample-image').addEventListener('click', () => { imageLoadPromise=loadSampleImage().finally(()=>{imageLoadPromise=null;}); });
 $('#camera-toggle').addEventListener('click', toggleCamera);
-refs.run.addEventListener('click', runCode); refs.stop.addEventListener('click', () => stopExecution());
+refs.executionTarget.addEventListener('change', () => {
+  executionTarget = refs.executionTarget.value === 'unitv' ? 'unitv' : 'simulator';
+  localStorage.setItem('unitv-execution-target', executionTarget);
+  if (executionTarget === 'unitv' && cameraStream) stopCamera();
+  renderExecutionTarget();
+  setRuntime(executionTarget === 'unitv' ? '実機モード' : 'ブラウザモード', executionTarget === 'unitv' ? 'USB接続したUnitVでPythonを実行します' : '画像を選択して疑似UnitV環境で実行します');
+});
+refs.unitvConnect.addEventListener('click', () => void connectUnitV());
+serialTransport.onDisconnect = () => { if (!realConnectionBusy) void disconnectUnitV({ unexpected:true }); };
+refs.run.addEventListener('click', runCode); refs.stop.addEventListener('click', () => void stopExecution());
 $('#clear-log').addEventListener('click', () => { refs.terminal.innerHTML=''; addLog('system','ログを消去しました。'); });
 $('#download-image').addEventListener('click', () => refs.canvas.toBlob(blob => blob && downloadBlob(blob,'unitv-output.png'),'image/png'));
 $('#uart-queue').addEventListener('click', () => { try { uartQueued=parseUartInput(); addLog('system',`UART受信キューに ${uartQueued.length} byte を設定しました。`); } catch(error){finishWithError(error.message);} });
@@ -1686,16 +1869,16 @@ try {
   ['owner','repo','message'].forEach(key=>{ if(savedGithub[key]) $(`#github-${key}`).value=savedGithub[key]; });
 } catch { /* Invalid old settings are ignored. */ }
 ['branch','message'].forEach(key => $(`#github-${key}`).addEventListener('input', () => { saveGithubSettings(githubSettings()); renderGithubState(); }));
-$('#github-repository').addEventListener('change', event => {
+$('#github-repository').addEventListener('change', async event => {
   const repository = githubRepositories.find(item => item.fullName === event.target.value);
-  applyGithubRepository(repository, true); setGithubControlsBusy(false);
+  await applyGithubRepository(repository, true);
 });
-renderGithubAccount(); renderGithubState(); setGithubControlsBusy(false);
+renderGithubAccount(); renderGithubState(); setGithubControlsBusy(false); renderExecutionTarget();
 $('#project-save').addEventListener('click',()=>$('#save-dialog').showModal()); $('#confirm-save').addEventListener('click',saveProject);
 $('#project-open').addEventListener('click',()=>$('#project-file').click()); $('#project-file').addEventListener('change',async event=>{try{await openProject(event.target.files[0]);}catch(error){finishWithError(`プロジェクトを開けません: ${error.message}`);}event.target.value='';});
 document.querySelectorAll('dialog').forEach(dialog => dialog.addEventListener('click', event => { if(event.target===dialog)dialog.close(); }));
 document.addEventListener('keydown', event => { if (event.key === 'Escape' && document.querySelector('.code-panel')?.classList.contains('editor-fullscreen')) toggleEditorFullscreen(); });
-window.addEventListener('beforeunload',()=>{ worker?.terminate(); cameraStream?.getTracks().forEach(track=>track.stop()); });
+window.addEventListener('beforeunload',()=>{ worker?.terminate(); cameraStream?.getTracks().forEach(track=>track.stop()); if (serialTransport.connected) { void realUnitV.stop(); void realUnitV.setFrameBufferEnabled(false); } });
 
 addLog('system', '画像を選択し、コードを確認して「実行」を押してください。');
 await initializeEditor();
