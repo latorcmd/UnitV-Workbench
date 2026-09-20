@@ -325,6 +325,8 @@ async function proxyGithubRequest(request, env) {
   const headers = new Headers();
   headers.set('Content-Type', response.headers.get('Content-Type') || 'application/json; charset=utf-8');
   headers.set('Cache-Control', 'no-store');
+  const contentLength = response.headers.get('Content-Length');
+  if (contentLength) headers.set('Content-Length', contentLength);
   return new Response(response.body, { status: response.status, headers });
 }
 

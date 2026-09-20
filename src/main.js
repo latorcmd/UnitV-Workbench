@@ -8,11 +8,12 @@ import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirro
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { tags } from '@lezer/highlight';
 import { MergeView } from '@codemirror/merge';
-import { unzipSync } from 'fflate';
 import { LatestBranchLoader } from './github-branch-loader.js';
 import { loadCompleteGitTree } from './github-tree.js';
 import { MaixPyIdeClient } from './maixpy-ide.js';
 import { WebSerialTransport } from './serial-transport.js';
+import { ensureStorageCapacity, formatByteSize } from './storage-capacity.js';
+import { streamZipResponse } from './streaming-zip.js';
 import {
   createEntry, createProject, deleteProject, listProjectEntries, listProjects,
   removeEntry, replaceProjectEntries, saveEntries, saveEntry, saveProjectRecord
@@ -20,7 +21,6 @@ import {
 
 const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_TEXT_BYTES = 1024 * 1024;
-const MAX_PROJECT_BYTES = 50 * 1024 * 1024;
 const EXECUTION_LIMIT_MS = 8000;
 const initialTheme = localStorage.getItem('unitv-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
 document.documentElement.dataset.theme = initialTheme;
@@ -1341,7 +1341,7 @@ async function saveProject() {
 }
 
 async function openProject(file) {
-  if (file.size > 80 * 1024 * 1024) throw new Error('プロジェクトファイルが大きすぎます。');
+  await ensureStorageCapacity(file.size);
   const data=JSON.parse(await file.text()); if(![1,2,3,4].includes(data.version)) throw new Error(`未対応のプロジェクトバージョンです: ${data.version}`);
   const reusableGithubSource = data.version >= 3 && data.source?.type === 'github' && data.source.owner && data.source.repo && data.source.branch && data.source.headSha;
   const importedProject=createProject(uniqueProjectName(data.name || file.name.replace(/\.unitvproj$/i,'')), reusableGithubSource ? data.source : {type:'local'});
@@ -1353,9 +1353,10 @@ async function openProject(file) {
     const text=String(item.text||''); const size=item.kind === 'text' || !item.kind ? new Blob([text]).size : blob?.size || Number(item.size) || 0;
     if ((item.kind === 'text' || !item.kind) && size > MAX_TEXT_BYTES) throw new Error(`${path} はテキスト上限の1 MBを超えています。`);
     if (item.kind === 'image' && size > MAX_IMAGE_BYTES) throw new Error(`${path} は画像上限の15 MBを超えています。`);
-    importedBytes += size; if (importedBytes > MAX_PROJECT_BYTES) throw new Error('プロジェクトの合計サイズが50 MBを超えています。');
+    importedBytes += size;
     imported.push(createEntry({projectId:importedProject.id,path,kind:item.kind||'text',text,blob,mime:item.mime||blob?.type||'',size,mode:item.mode||'100644',basePath:item.basePath||null,baseSha:item.baseSha||null,baseText:item.baseText??null,order:index}));
   }
+  await ensureStorageCapacity(importedBytes);
   if(!imported.length) imported.push(createEntry({projectId:importedProject.id,path:'main.py',kind:'text',text:'',order:0}));
   importedProject.activePath=data.activePath||data.activeFile||imported[0].path; projects.unshift(importedProject); await saveProjectRecord(importedProject); await saveEntries(imported);
   refs.uart.value=data.uart?.value||''; refs.uartFormat.value=data.uart?.format||'text';
@@ -1657,9 +1658,21 @@ async function blobToBase64(blob) { return bytesToBase64(new Uint8Array(await bl
 
 function describeRepositoryProgress(progress) {
   if (progress.phase === 'tree-walk') return `大規模リポジトリを走査しています… ${progress.entries.toLocaleString('ja-JP')}項目`;
-  if (progress.phase === 'archive') return 'リポジトリ本体をダウンロードしています…';
-  if (progress.phase === 'unpack') return `ファイルを展開しています… ${progress.current.toLocaleString('ja-JP')} / ${progress.total.toLocaleString('ja-JP')}`;
+  if (progress.phase === 'capacity') return `保存容量を確認しています… ${formatByteSize(progress.requiredBytes)}`;
+  if (progress.phase === 'archive') return `リポジトリ本体を準備しています… ${progress.total.toLocaleString('ja-JP')}ファイル`;
+  if (progress.phase === 'download') {
+    const total = progress.totalDownloadBytes ? ` / ${formatByteSize(progress.totalDownloadBytes)}` : '';
+    return `ダウンロード・展開中… ${formatByteSize(progress.downloadedBytes)}${total} · ${progress.extractedFiles.toLocaleString('ja-JP')}ファイル`;
+  }
+  if (progress.phase === 'extract') return `ダウンロード・展開中… ${formatByteSize(progress.downloadedBytes)} · ${progress.extractedFiles.toLocaleString('ja-JP')}ファイル`;
   return 'ファイル一覧を取得しています…';
+}
+
+function concatenateChunks(chunks, size) {
+  if (chunks.length === 1 && chunks[0].byteLength === size) return chunks[0];
+  const bytes = new Uint8Array(size); let offset = 0;
+  chunks.forEach(chunk => { bytes.set(chunk, offset); offset += chunk.byteLength; });
+  return bytes;
 }
 
 async function fetchRepositorySnapshot(settings, onProgress = () => {}) {
@@ -1674,57 +1687,54 @@ async function fetchRepositorySnapshot(settings, onProgress = () => {}) {
   });
   const tracked = treeEntries.filter(item => item.type === 'blob' || item.type === 'commit');
   const declaredBytes = tracked.reduce((total, item) => total + (Number(item.size) || 0), 0);
-  if (declaredBytes > MAX_PROJECT_BYTES) throw new Error('プロジェクトの合計サイズが50 MBを超えています。');
+  onProgress({ phase:'capacity', requiredBytes:declaredBytes });
+  await ensureStorageCapacity(declaredBytes + tracked.length * 1024);
   const oversizedImage = tracked.find(item => imageMime(item.path) && Number(item.size) > MAX_IMAGE_BYTES);
   if (oversizedImage) throw new Error(`${oversizedImage.path} は画像上限の15 MBを超えています。`);
   onProgress({ phase:'archive', total:tracked.length });
   const archiveResponse = await githubRequestRaw(`${repo}/zipball/${branch}`);
-  const archive = new Uint8Array(await archiveResponse.arrayBuffer());
-  if (archive.byteLength > MAX_PROJECT_BYTES) throw new Error('リポジトリのダウンロードサイズが50 MBを超えています。');
-  const unpacked = unzipSync(archive);
-  const archiveNames = Object.keys(unpacked).filter(name => !name.endsWith('/'));
-  const archiveFiles = new Map(archiveNames.map(name => [name.split('/').slice(1).join('/'), unpacked[name]]));
-  const entries = []; let totalBytes = 0;
-  const reportUnpackProgress = async current => {
-    if (current % 250 !== 0) return;
-    onProgress({ phase:'unpack', current, total:tracked.length });
-    await sleep(0);
-  };
-  for (const [order, item] of tracked.entries()) {
+  const trackedByPath = new Map(); const entries = [];
+  tracked.forEach((item, order) => {
     const path = normalizeProjectPath(item.path);
-    if (item.type === 'commit') {
-      entries.push({ path, kind:'submodule', size:0, mode:item.mode, basePath:path, baseSha:item.sha, order });
-      await reportUnpackProgress(order + 1);
-      continue;
-    }
-    const bytes = archiveFiles.get(path);
-    if (!bytes) throw new Error(`アーカイブ内に ${path} が見つかりません。`);
-    totalBytes += bytes.byteLength;
-    if (totalBytes > MAX_PROJECT_BYTES) throw new Error('展開後のプロジェクトサイズが50 MBを超えています。');
-    const mime = imageMime(path);
-    if (mime) {
-      if (bytes.byteLength > MAX_IMAGE_BYTES) throw new Error(`${path} は画像上限の15 MBを超えています。`);
-      entries.push({ path, kind:'image', blob:new Blob([bytes], { type:mime }), mime, size:bytes.byteLength, mode:item.mode, basePath:path, baseSha:item.sha, order });
-      await reportUnpackProgress(order + 1);
-      continue;
-    }
-    if (bytes.byteLength > MAX_TEXT_BYTES) {
-      try {
-        const decoded = new TextDecoder('utf-8', { fatal:true }).decode(bytes);
-        if (!decoded.includes('\0')) throw new Error(`${path} はテキスト上限の1 MBを超えています。`);
-      } catch (error) {
-        if (error instanceof Error && error.message.includes('テキスト上限')) throw error;
+    if (item.type === 'blob') trackedByPath.set(path, { item, order });
+    else entries.push({ path, kind:'submodule', size:0, mode:item.mode, basePath:path, baseSha:item.sha, order });
+  });
+  const seenPaths = new Set();
+  await streamZipResponse(archiveResponse, {
+    onProgress,
+    onFile:({ name, chunks, size }) => {
+      const path = normalizeProjectPath(name.split('/').slice(1).join('/'));
+      const trackedFile = trackedByPath.get(path);
+      if (!trackedFile) return;
+      const { item, order } = trackedFile; seenPaths.add(path);
+      if (size !== Number(item.size)) throw new Error(`${path} の展開サイズがGitHubの情報と一致しません。`);
+      const mime = imageMime(path);
+      if (mime) {
+        if (size > MAX_IMAGE_BYTES) throw new Error(`${path} は画像上限の15 MBを超えています。`);
+        entries.push({ path, kind:'image', blob:new Blob(chunks, { type:mime }), mime, size, mode:item.mode, basePath:path, baseSha:item.sha, order });
+        return;
       }
+      if (size > MAX_TEXT_BYTES) {
+        try {
+          const bytes = concatenateChunks(chunks, size);
+          const decoded = new TextDecoder('utf-8', { fatal:true }).decode(bytes);
+          if (!decoded.includes('\0')) throw new Error(`${path} はテキスト上限の1 MBを超えています。`);
+        } catch (error) {
+          if (error instanceof Error && error.message.includes('テキスト上限')) throw error;
+        }
+      }
+      let text = null;
+      if (size <= MAX_TEXT_BYTES) {
+        const bytes = concatenateChunks(chunks, size);
+        try { const decoded = new TextDecoder('utf-8', { fatal:true }).decode(bytes); if (!decoded.includes('\0')) text = decoded; } catch { /* read-only binary */ }
+      }
+      if (text !== null) entries.push({ path, kind:'text', text, size, mode:item.mode, basePath:path, baseSha:item.sha, baseText:text, order });
+      else entries.push({ path, kind:'binary', blob:new Blob(chunks, { type:'application/octet-stream' }), mime:'application/octet-stream', size, mode:item.mode, basePath:path, baseSha:item.sha, order });
     }
-    let text = null;
-    if (bytes.byteLength <= MAX_TEXT_BYTES) {
-      try { const decoded = new TextDecoder('utf-8', { fatal:true }).decode(bytes); if (!decoded.includes('\0')) text = decoded; } catch { /* read-only binary */ }
-    }
-    if (text !== null) entries.push({ path, kind:'text', text, size:bytes.byteLength, mode:item.mode, basePath:path, baseSha:item.sha, baseText:text, order });
-    else entries.push({ path, kind:'binary', blob:new Blob([bytes], { type:'application/octet-stream' }), mime:'application/octet-stream', size:bytes.byteLength, mode:item.mode, basePath:path, baseSha:item.sha, order });
-    await reportUnpackProgress(order + 1);
-  }
-  onProgress({ phase:'unpack', current:tracked.length, total:tracked.length });
+  });
+  const missing = [...trackedByPath.keys()].find(path => !seenPaths.has(path));
+  if (missing) throw new Error(`アーカイブ内に ${missing} が見つかりません。`);
+  entries.sort((a, b) => a.order - b.order);
   return { entries, headSha:reference.object.sha, treeSha:commit.tree.sha };
 }
 
