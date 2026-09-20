@@ -289,6 +289,12 @@ document.querySelector('#app').innerHTML = `
     <form method="dialog">
       <div class="dialog-head"><div><span class="panel-kicker amber">LAB THRESHOLD EDITOR</span><h2>画像からLAB閾値を作る</h2></div><button value="close" aria-label="閉じる">×</button></div>
       <p class="dialog-intro">画像上をドラッグして色の範囲を選択してください。選択領域から外れ値を除いて閾値を計算します。</p>
+      <div class="threshold-source-picker" role="group" aria-label="閾値に使う画像">
+        <div class="threshold-source-label"><strong>対象画像</strong><small>同じ閾値のまま切り替えられます</small></div>
+        <button type="button" data-threshold-source="frame" aria-pressed="true"><span>フレームバッファ</span><small>現在の出力画像</small></button>
+        <button type="button" data-threshold-source="saved" aria-pressed="false"><span>保存画像</span><small>読み込んだ元画像</small></button>
+        <output id="threshold-source-meta">画像を選択してください</output>
+      </div>
       <div class="threshold-layout">
         <div class="threshold-stage"><canvas id="threshold-canvas"></canvas><span id="threshold-hint">ドラッグで範囲選択</span></div>
         <div class="threshold-gauges" aria-label="LAB閾値ゲージ">
@@ -343,6 +349,9 @@ const refs = {
 let sourceImage = null;
 let sourceImageDataUrl = null;
 let sourceImageName = '';
+let savedImage = null;
+let savedImageName = '';
+let frameBufferImage = null;
 let imageLoadPromise = null;
 let worker = null;
 let executionTimer = null;
@@ -362,6 +371,8 @@ let thresholdValues = [0, 100, -128, 127, -128, 127];
 let thresholdSelection = null;
 let thresholdDragStart = null;
 let thresholdPreviewFrame = null;
+let thresholdSourceImage = null;
+let thresholdSourceKind = 'frame';
 let githubToken = '';
 
 const editorHighlight = HighlightStyle.define([
@@ -624,6 +635,7 @@ async function loadImageFile(file, knownDataUrl = null) {
   const temp = document.createElement('canvas'); temp.width = bitmap.width; temp.height = bitmap.height;
   const ctx = temp.getContext('2d', { willReadFrequently: true }); ctx.drawImage(bitmap, 0, 0); bitmap.close();
   sourceImage = ctx.getImageData(0, 0, temp.width, temp.height); sourceImageDataUrl = knownDataUrl || await fileToDataUrl(file); sourceImageName = file.name;
+  savedImage = copyImageData(sourceImage); savedImageName = file.name;
   drawFrame(sourceImage); refs.imageLabel.textContent = file.name; refs.imageDetail.textContent = `${sourceImage.width} × ${sourceImage.height}・${(file.size/1024/1024).toFixed(1)} MB`;
   $('#threshold-open').disabled = false;
   setRuntime('準備完了', 'コードを実行できます'); addLog('system', `画像を読み込みました: ${file.name} (${sourceImage.width} × ${sourceImage.height})`);
@@ -701,9 +713,14 @@ async function toggleCamera() {
 }
 
 function drawFrame(imageData) {
+  frameBufferImage = copyImageData(imageData);
   refs.canvas.width = imageData.width; refs.canvas.height = imageData.height;
-  refs.canvas.getContext('2d').putImageData(imageData, 0, 0); refs.canvas.hidden = false; refs.camera.hidden = true; refs.empty.hidden = true;
+  refs.canvas.getContext('2d').putImageData(frameBufferImage, 0, 0); refs.canvas.hidden = false; refs.camera.hidden = true; refs.empty.hidden = true;
   refs.frameMeta.textContent = `${imageData.width} × ${imageData.height}`; $('#download-image').disabled = false;
+}
+
+function copyImageData(imageData) {
+  return new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
 }
 
 function rgbToLab(r, g, b) {
@@ -751,19 +768,19 @@ function scheduleThresholdPreview() {
 }
 
 function drawThresholdPreview() {
-  if (!sourceImage) return;
-  const canvas = $('#threshold-canvas'); canvas.width = sourceImage.width; canvas.height = sourceImage.height;
-  const output = new Uint8ClampedArray(sourceImage.data); let matched = 0;
+  if (!thresholdSourceImage) return;
+  const canvas = $('#threshold-canvas'); canvas.width = thresholdSourceImage.width; canvas.height = thresholdSourceImage.height;
+  const output = new Uint8ClampedArray(thresholdSourceImage.data); let matched = 0;
   for (let i = 0; i < output.length; i += 4) {
     if (thresholdMatches(rgbToLab(output[i], output[i + 1], output[i + 2]))) { matched += 1; continue; }
     const gray = Math.round(output[i] * .299 + output[i + 1] * .587 + output[i + 2] * .114);
     output[i] = gray * .36; output[i + 1] = gray * .36; output[i + 2] = gray * .36;
   }
-  const context = canvas.getContext('2d'); context.putImageData(new ImageData(output, sourceImage.width, sourceImage.height), 0, 0);
+  const context = canvas.getContext('2d'); context.putImageData(new ImageData(output, thresholdSourceImage.width, thresholdSourceImage.height), 0, 0);
   if (thresholdSelection) {
-    const { x, y, width, height } = thresholdSelection; context.strokeStyle = '#ffae42'; context.lineWidth = Math.max(2, sourceImage.width / 220); context.setLineDash([8, 5]); context.strokeRect(x, y, width, height); context.setLineDash([]);
+    const { x, y, width, height } = thresholdSelection; context.strokeStyle = '#ffae42'; context.lineWidth = Math.max(2, thresholdSourceImage.width / 220); context.setLineDash([8, 5]); context.strokeRect(x, y, width, height); context.setLineDash([]);
   }
-  const total = sourceImage.width * sourceImage.height;
+  const total = thresholdSourceImage.width * thresholdSourceImage.height;
   $('#threshold-stats').textContent = `一致: ${matched.toLocaleString()} px（${(matched / total * 100).toFixed(1)}%）`;
   $('#threshold-value').textContent = `(${thresholdValues.join(', ')})`;
   updateThresholdGauges();
@@ -775,11 +792,11 @@ function percentile(values, ratio) {
 }
 
 function calculateThresholdFromSelection() {
-  if (!sourceImage || !thresholdSelection) return;
+  if (!thresholdSourceImage || !thresholdSelection) return;
   const { x, y, width, height } = thresholdSelection; const channels = [[], [], []];
   const step = Math.max(1, Math.floor(Math.sqrt(width * height / 18000)));
   for (let py = y; py < y + height; py += step) for (let px = x; px < x + width; px += step) {
-    const index = (py * sourceImage.width + px) * 4; const lab = rgbToLab(sourceImage.data[index], sourceImage.data[index + 1], sourceImage.data[index + 2]);
+    const index = (py * thresholdSourceImage.width + px) * 4; const lab = rgbToLab(thresholdSourceImage.data[index], thresholdSourceImage.data[index + 1], thresholdSourceImage.data[index + 2]);
     lab.forEach((value, channel) => channels[channel].push(value));
   }
   const low = channels.map(channel => percentile(channel, .05)); const high = channels.map(channel => percentile(channel, .95));
@@ -791,11 +808,31 @@ function calculateThresholdFromSelection() {
   drawThresholdPreview();
 }
 
+function updateThresholdSourceButtons() {
+  document.querySelectorAll('[data-threshold-source]').forEach(button => {
+    const image = button.dataset.thresholdSource === 'frame' ? frameBufferImage : savedImage;
+    button.disabled = !image;
+    const active = button.dataset.thresholdSource === thresholdSourceKind && Boolean(image);
+    button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active));
+  });
+}
+
+function selectThresholdSource(kind) {
+  const image = kind === 'frame' ? frameBufferImage : savedImage;
+  if (!image) return false;
+  thresholdSourceKind = kind; thresholdSourceImage = copyImageData(image); thresholdSelection = null;
+  const label = kind === 'frame' ? 'フレームバッファ' : `保存画像: ${savedImageName || '名称なし'}`;
+  $('#threshold-source-meta').textContent = `${label}・${image.width} × ${image.height}`;
+  updateThresholdSourceButtons(); drawThresholdPreview();
+  return true;
+}
+
 async function openThresholdEditor() {
   if (cameraStream) await captureCameraFrame();
-  if (!sourceImage) { finishWithError('先に画像を選択してください。'); return; }
+  if (!frameBufferImage && !savedImage) { finishWithError('先に画像を選択するか、コードを実行してください。'); return; }
   thresholdSelection = null; thresholdValues = [0, 100, -128, 127, -128, 127];
-  drawThresholdPreview(); $('#threshold-dialog').showModal();
+  thresholdSourceKind = frameBufferImage ? 'frame' : 'saved'; updateThresholdSourceButtons();
+  selectThresholdSource(thresholdSourceKind); $('#threshold-dialog').showModal();
 }
 
 function insertThreshold() {
@@ -1015,6 +1052,7 @@ document.querySelectorAll('[data-gpio]').forEach(button => button.addEventListen
 
 $('#api-open').addEventListener('click',()=>$('#api-dialog').showModal());
 $('#threshold-open').addEventListener('click', openThresholdEditor);
+document.querySelectorAll('[data-threshold-source]').forEach(button => button.addEventListener('click', () => selectThresholdSource(button.dataset.thresholdSource)));
 const thresholdCanvas = $('#threshold-canvas');
 thresholdCanvas.addEventListener('pointerdown', event => { thresholdDragStart = thresholdPoint(event); thresholdCanvas.setPointerCapture(event.pointerId); thresholdSelection = { x:thresholdDragStart.x,y:thresholdDragStart.y,width:1,height:1 }; drawThresholdPreview(); });
 thresholdCanvas.addEventListener('pointermove', event => { if (!thresholdDragStart) return; const point=thresholdPoint(event); thresholdSelection={x:Math.min(point.x,thresholdDragStart.x),y:Math.min(point.y,thresholdDragStart.y),width:Math.abs(point.x-thresholdDragStart.x)+1,height:Math.abs(point.y-thresholdDragStart.y)+1}; drawThresholdPreview(); });

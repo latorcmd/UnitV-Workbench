@@ -208,6 +208,14 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .dialog-intro { margin: -5px 0 16px; color: var(--muted); font-size: 13px; line-height: 1.6; }
 .threshold-dialog { width: min(1040px,calc(100vw - 28px)); max-height:calc(100dvh - 24px); }
 .threshold-dialog form { max-height:calc(100dvh - 24px); overflow:auto; }
+.threshold-source-picker { display:grid; grid-template-columns:auto minmax(150px,1fr) minmax(150px,1fr) minmax(180px,auto); align-items:stretch; gap:8px; margin:-3px 0 14px; }
+.threshold-source-label { display:flex; flex-direction:column; justify-content:center; gap:3px; padding-right:6px; color:var(--text); font-size:12px; }
+.threshold-source-label small { color:var(--muted); font-size:10px; font-weight:400; white-space:nowrap; }
+.threshold-source-picker button { display:flex; flex-direction:column; align-items:flex-start; justify-content:center; gap:3px; min-width:0; padding:9px 12px; border:1px solid var(--line); border-radius:8px; background:#071119; color:var(--text); cursor:pointer; text-align:left; }
+.threshold-source-picker button span { font-size:12px; font-weight:700; }.threshold-source-picker button small { color:var(--muted); font-size:10px; }
+.threshold-source-picker button:hover:not(:disabled) { border-color:#52717e; }.threshold-source-picker button.active { border-color:var(--cyan); background:color-mix(in srgb,var(--cyan) 13%,#071119); box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--cyan) 45%,transparent); }
+.threshold-source-picker button:disabled { cursor:not-allowed; opacity:.42; }
+#threshold-source-meta { display:flex; align-items:center; justify-content:flex-end; min-width:0; color:var(--amber); font:700 11px/1.4 "Cascadia Code",monospace; text-align:right; overflow-wrap:anywhere; }
 .threshold-layout { display: grid; grid-template-columns: minmax(0,1fr); gap: 14px; }
 .threshold-stage { position: relative; min-height: 330px; display: grid; place-items: center; overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: #050c11; background-image: linear-gradient(#ffffff08 1px,transparent 1px),linear-gradient(90deg,#ffffff08 1px,transparent 1px); background-size: 18px 18px; }
 #threshold-canvas { max-width: 100%; max-height: 48vh; cursor: crosshair; touch-action: none; image-rendering: auto; }
@@ -266,12 +274,13 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 :root[data-theme="light"] .file-sidebar { background:#f4f8f9; }:root[data-theme="light"] .file-row:hover { background:#e7eff1; }:root[data-theme="light"] .file-row.active { background:#d8eeed; }
 :root[data-theme="light"] #code-editor .cm-editor { background:#fff; }:root[data-theme="light"] #code-editor .cm-gutters { background:#f2f6f7; color:#82949b; }:root[data-theme="light"] #code-editor .cm-activeLine,:root[data-theme="light"] #code-editor .cm-activeLineGutter { background:#008f860b; }
 :root[data-theme="light"] .dialog { color:var(--text); background:#fff; box-shadow:0 30px 100px #36515b45; }:root[data-theme="light"] .dialog::backdrop { background:#d8e1e6b8; }
-:root[data-theme="light"] .dialog-head>button,:root[data-theme="light"] .api-grid section,:root[data-theme="light"] .threshold-gauge,:root[data-theme="light"] .github-grid input,:root[data-theme="light"] .dialog-field input,:root[data-theme="light"] .threshold-result,:root[data-theme="light"] .threshold-stats,:root[data-theme="light"] .github-status { background:#f5f8f9; color:var(--text); }
+:root[data-theme="light"] .dialog-head>button,:root[data-theme="light"] .api-grid section,:root[data-theme="light"] .threshold-gauge,:root[data-theme="light"] .threshold-source-picker button,:root[data-theme="light"] .github-grid input,:root[data-theme="light"] .dialog-field input,:root[data-theme="light"] .threshold-result,:root[data-theme="light"] .threshold-stats,:root[data-theme="light"] .github-status { background:#f5f8f9; color:var(--text); }
+:root[data-theme="light"] .threshold-source-picker button.active { background:#ddf2f0; }
 :root[data-theme="light"] .danger-button { background:#fff0f1; color:#ad2434; border-color:#e3aeb4; }
 :root[data-theme="light"] #threshold-hint { background:#ffffffdf; color:#334950; }
 
 @media (max-width:1050px) { .editor-workspace { height:540px; } }
 @media (max-width:680px) {
   .editor-workspace { height:520px; grid-template-columns:112px minmax(0,1fr); }.file-open { grid-template-columns:20px minmax(0,1fr); padding-left:3px; }.file-sidebar>small { display:none; }
-  .editor-status { gap:8px; }.editor-status span:last-child { display:none; }.github-grid { grid-template-columns:1fr; }.github-token { grid-column:1; }.threshold-stage { min-height:250px; }.threshold-summary { grid-template-columns:1fr; }.threshold-gauge { padding-inline:10px; }.threshold-gauge-scale { grid-template-columns:minmax(0,1fr); gap:0; }.threshold-gauge-scale>span { display:none; }
+  .editor-status { gap:8px; }.editor-status span:last-child { display:none; }.github-grid { grid-template-columns:1fr; }.github-token { grid-column:1; }.threshold-source-picker { grid-template-columns:1fr 1fr; }.threshold-source-label { grid-column:1/-1; }.threshold-source-picker>output { grid-column:1/-1; justify-content:flex-start; text-align:left; }.threshold-stage { min-height:250px; }.threshold-summary { grid-template-columns:1fr; }.threshold-gauge { padding-inline:10px; }.threshold-gauge-scale { grid-template-columns:minmax(0,1fr); gap:0; }.threshold-gauge-scale>span { display:none; }
 }
