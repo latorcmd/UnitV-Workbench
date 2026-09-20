@@ -22,10 +22,12 @@
 - 複数の `.py` ファイルを端末内に永続保存し、ファイル間の `import` に利用可能
 - 端末カメラのライブプレビューと、`sensor.snapshot()` ごとの連続撮影・画像処理（HTTPSまたはlocalhostが必要）
 - フレームバッファの現在画像と保存した元画像を切り替え、選択領域からLAB閾値を算出。L・a・bの2点ゲージで微調整してMaixPy形式でコピーまたはコードへ挿入
-- GitHub連携画面からプル、コミット、プッシュ、最近のコミット確認（利用者自身のfine-grained tokenをタブ内だけで使用）
+- GitHub Appでログインし、許可したリポジトリを選んでプル、コミット、プッシュ、最近のコミットを確認
 - ライト／ダーク表示。選択は端末内に保存
 
-組み込みサンプル画像は `r5.png` です。カメラ映像、GitHubトークン、PythonコードはUnitV Browser Labのサーバーには保存されません。GitHub連携を実行した場合だけGitHub APIと通信します。プルで上書きされるローカル変更は、自動的に別のPythonファイルへバックアップされます。コミットとプッシュは分離され、プッシュ前にGitHub側が更新されていた場合は強制上書きせず停止します。
+組み込みサンプル画像は `r5.png` です。カメラ映像とPythonコードはUnitV Browser Labのサーバーには保存されません。GitHubの認証情報は公開版のWorkerが暗号化したHttpOnly Cookieで保持し、ブラウザのJavaScriptやlocalStorageには公開しません。GitHub連携を実行した場合だけGitHub APIと通信します。プルで上書きされるローカル変更は、自動的に別のPythonファイルへバックアップされます。コミットとプッシュは分離され、プッシュ前にGitHub側が更新されていた場合は強制上書きせず停止します。
+
+GitHub連携には `unitv-browser-lab` GitHub Appを使用します。Device Flowを有効にし、Repository permissions の Contents を Read and write、Metadata を Read-onlyに設定してください。サーバー側では `SESSION_SECRET` を秘密の環境変数として設定します。オフライン配布版は画像処理とプロジェクト保存に対応しますが、GitHubログインには公開版のWorkerが必要です。
 
 KPUおよび `.kmodel` の推論は対応していません。
 

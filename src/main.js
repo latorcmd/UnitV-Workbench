@@ -324,16 +324,27 @@ document.querySelector('#app').innerHTML = `
   <dialog id="github-dialog" class="dialog github-dialog">
     <form method="dialog">
       <div class="dialog-head"><div><span class="panel-kicker">GITHUB SYNC</span><h2>GitHubリポジトリと連携</h2></div><button value="close" aria-label="閉じる">×</button></div>
-      <p class="dialog-intro">プル、コミット、プッシュを順番に実行できます。トークンはこのタブのメモリだけに保持し、UnitV Browser Labのサーバーには送信しません。</p>
+      <p class="dialog-intro">GitHubでログインし、アクセスを許可したリポジトリを選んでください。認証情報は暗号化されたセッションとして保持され、ブラウザのコードやlocalStorageには保存されません。</p>
+      <div class="github-auth-bar">
+        <div id="github-account"><strong>未ログイン</strong><small>GitHub Appで安全に接続します</small></div>
+        <a id="github-install" href="https://github.com/apps/unitv-browser-lab/installations/new" target="_blank" rel="noreferrer" hidden>権限を設定</a>
+        <button type="button" class="ghost-button" id="github-login">GitHubでログイン</button>
+        <button type="button" class="ghost-button" id="github-logout" hidden>ログアウト</button>
+      </div>
+      <section class="github-device" id="github-device" hidden>
+        <span>GitHubに入力する確認コード</span>
+        <strong id="github-device-code">----</strong>
+        <p>下のボタンからGitHubを開き、表示されたコードを入力して許可してください。この画面は自動的に接続を確認します。</p>
+        <a class="run-button" id="github-device-open" href="https://github.com/login/device" target="_blank" rel="noreferrer">GitHubを開いて許可</a>
+      </section>
       <div class="github-grid">
-        <label><span>所有者</span><input id="github-owner" autocomplete="off" placeholder="octocat"></label>
-        <label><span>リポジトリ</span><input id="github-repo" autocomplete="off" placeholder="unitv-project"></label>
+        <label class="github-repository-field"><span>許可済みリポジトリ</span><select id="github-repository" disabled><option value="">ログインすると選択できます</option></select></label>
+        <input id="github-owner" type="hidden"><input id="github-repo" type="hidden">
         <label><span>ブランチ</span><input id="github-branch" autocomplete="off" value="main"></label>
         <label><span>ファイルパス</span><input id="github-path" autocomplete="off" value="main.py"></label>
-        <label class="github-token"><span>Fine-grained token（Contents: Read and write）</span><input id="github-token" type="password" autocomplete="off" placeholder="github_pat_…"></label>
-        <label class="github-token"><span>コミットメッセージ</span><input id="github-message" value="Update from UnitV Browser Lab"></label>
+        <label class="github-message-field"><span>コミットメッセージ</span><input id="github-message" value="Update from UnitV Browser Lab"></label>
       </div>
-      <div class="github-auth-bar"><div id="github-account"><strong>未接続</strong><small>トークンは保存されません</small></div><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer">トークンを作成 ↗</a><button type="button" class="ghost-button" id="github-connect">接続確認</button></div>
+      <div class="github-repository-actions"><button type="button" class="ghost-button" id="github-refresh">リポジトリ一覧を更新</button><button type="button" class="ghost-button" id="github-connect">接続確認</button></div>
       <div class="github-worktree" id="github-worktree"><strong>GitHubの状態</strong><span>まず接続確認またはプルを実行してください。</span><button type="button" id="github-discard" hidden>保留コミットを破棄</button></div>
       <div id="github-status" class="github-status">未接続</div>
       <div class="github-flow" aria-label="GitHub操作">
@@ -380,8 +391,10 @@ let thresholdDragStart = null;
 let thresholdPreviewFrame = null;
 let thresholdSourceImage = null;
 let thresholdSourceKind = 'frame';
-let githubToken = '';
 let githubAccount = null;
+let githubRepositories = [];
+let githubAuthBusy = false;
+let githubPollGeneration = 0;
 let githubPendingCommit = null;
 let githubRemoteBaseline = null;
 
@@ -1020,18 +1033,153 @@ function githubBase64Decode(value) {
 }
 
 async function githubRequest(endpoint, options = {}) {
-  githubToken = $('#github-token').value.trim();
-  if (!githubToken) throw new Error('Fine-grained personal access tokenを入力してください。');
-  const response = await fetch(`https://api.github.com${endpoint}`, {
+  if (!githubAccount) throw new Error('先にGitHubでログインしてください。');
+  const response = await fetch(`/api/github/request?path=${encodeURIComponent(endpoint)}`, {
     ...options,
-    headers: { Accept: 'application/vnd.github+json', Authorization: `Bearer ${githubToken}`, 'X-GitHub-Api-Version': '2026-03-10', 'Content-Type': 'application/json', ...(options.headers || {}) }
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    const fallback = response.status === 401 ? 'トークンを確認してください。' : response.status === 403 ? 'リポジトリのContents権限を確認してください。' : `GitHub API: HTTP ${response.status}`;
-    const error = new Error(body.message || fallback); error.status = response.status; throw error;
+    const fallback = response.status === 401 ? 'GitHubへもう一度ログインしてください。' : response.status === 403 ? 'このリポジトリへのContents権限を確認してください。' : `GitHub API: HTTP ${response.status}`;
+    const error = new Error(body.message || body.error || fallback); error.status = response.status; throw error;
   }
   return response.status === 204 ? null : response.json();
+}
+
+async function githubApi(path, options = {}) {
+  const response = await fetch(path, { ...options, credentials: 'same-origin' });
+  if (!(response.headers.get('Content-Type') || '').includes('application/json')) {
+    const error = new Error('GitHubログインは公開版のサイトで利用してください。');
+    error.status = response.status; throw error;
+  }
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(body.error || `GitHub連携: HTTP ${response.status}`);
+    error.status = response.status; error.details = body.details; throw error;
+  }
+  return body;
+}
+
+function sleep(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function renderGithubAccount() {
+  const account = $('#github-account');
+  const login = $('#github-login'); const logout = $('#github-logout'); const install = $('#github-install');
+  if (githubAccount) {
+    account.querySelector('strong').textContent = `@${githubAccount.login}`;
+    account.querySelector('small').textContent = githubRepositories.length
+      ? `${githubRepositories.length}件のリポジトリを利用できます`
+      : 'リポジトリへのアクセスを許可してください';
+    login.hidden = true; logout.hidden = false; install.hidden = false;
+  } else {
+    account.querySelector('strong').textContent = '未ログイン';
+    account.querySelector('small').textContent = 'GitHub Appで安全に接続します';
+    login.hidden = false; logout.hidden = true; install.hidden = true;
+  }
+}
+
+function renderGithubRepositories(preferredFullName = '') {
+  const select = $('#github-repository');
+  const current = preferredFullName || `${$('#github-owner').value}/${$('#github-repo').value}`;
+  select.replaceChildren();
+  if (!githubRepositories.length) {
+    const option = document.createElement('option');
+    option.value = ''; option.textContent = githubAccount ? '許可済みリポジトリがありません' : 'ログインすると選択できます';
+    select.append(option); select.disabled = true; $('#github-owner').value = ''; $('#github-repo').value = '';
+    return;
+  }
+  githubRepositories.forEach(repository => {
+    const option = document.createElement('option');
+    option.value = repository.fullName; option.textContent = `${repository.fullName}${repository.private ? '（非公開）' : ''}`;
+    select.append(option);
+  });
+  const preferred = githubRepositories.find(repository => repository.fullName === current);
+  const selected = preferred || githubRepositories[0];
+  select.value = selected.fullName; select.disabled = false;
+  applyGithubRepository(selected, !preferred);
+}
+
+function applyGithubRepository(repository, useDefaultBranch = true) {
+  if (!repository) return;
+  $('#github-owner').value = repository.owner;
+  $('#github-repo').value = repository.name;
+  if (useDefaultBranch || !$('#github-branch').value.trim()) $('#github-branch').value = repository.defaultBranch || 'main';
+  saveGithubSettings(githubSettings()); renderGithubState();
+}
+
+async function refreshGithubSession({ quiet = false } = {}) {
+  if (!quiet) githubSetStatus('GitHubの接続情報を確認中…', 'busy');
+  try {
+    const data = await githubApi('/api/github/session');
+    if (!data.authenticated || !data.user?.login) throw new Error('GitHubのログイン情報を確認できませんでした。');
+    githubAccount = data.user; githubRepositories = data.repositories || [];
+    $('#github-install').href = data.installUrl || 'https://github.com/apps/unitv-browser-lab/installations/new';
+    const saved = JSON.parse(localStorage.getItem('unitv-github-settings') || '{}');
+    renderGithubRepositories(saved.owner && saved.repo ? `${saved.owner}/${saved.repo}` : '');
+    renderGithubAccount();
+    githubSetStatus(githubRepositories.length
+      ? 'ログインしました。利用するリポジトリを選択してください。'
+      : 'ログインしました。「権限を設定」から利用するリポジトリを選んでください。', githubRepositories.length ? 'success' : 'busy');
+    return true;
+  } catch (error) {
+    githubAccount = null; githubRepositories = []; renderGithubRepositories(); renderGithubAccount();
+    if (!quiet && error.status !== 401) githubSetStatus(error.message, 'error');
+    else if (!quiet) githubSetStatus('GitHubでログインしてください。');
+    return false;
+  } finally {
+    setGithubControlsBusy(false); renderGithubState();
+  }
+}
+
+async function startGithubLogin() {
+  if (githubAuthBusy) return;
+  githubAuthBusy = true; setGithubControlsBusy(true); githubSetStatus('GitHubログインを準備中…', 'busy');
+  const generation = ++githubPollGeneration;
+  try {
+    const data = await githubApi('/api/github/device/start', { method: 'POST' });
+    $('#github-device-code').textContent = data.userCode;
+    $('#github-device-open').href = data.verificationUri;
+    $('#github-device').hidden = false;
+    githubSetStatus('GitHubを開き、確認コードを入力してください。', 'busy');
+    let retryAfter = Math.max(5, Number(data.interval) || 5);
+    const expiresAt = Date.now() + Number(data.expiresIn || 900) * 1000;
+    while (generation === githubPollGeneration && Date.now() < expiresAt) {
+      await sleep(retryAfter * 1000);
+      let result;
+      try {
+        result = await githubApi('/api/github/device/poll', { method: 'POST' });
+      } catch (error) {
+        if (error.status === 410 || error.details === 'access_denied') throw error;
+        throw error;
+      }
+      if (result.status === 'authenticated') {
+        $('#github-device').hidden = true;
+        await refreshGithubSession();
+        return;
+      }
+      retryAfter = Math.max(1, Number(result.retryAfter) || retryAfter);
+    }
+    if (generation === githubPollGeneration) throw new Error('確認コードの有効期限が切れました。もう一度ログインしてください。');
+  } catch (error) {
+    if (generation === githubPollGeneration) githubSetStatus(error.message, 'error');
+  } finally {
+    if (generation === githubPollGeneration) {
+      githubAuthBusy = false; setGithubControlsBusy(false);
+    }
+  }
+}
+
+async function logoutGithub() {
+  ++githubPollGeneration; githubAuthBusy = false;
+  await runGithubAction('GitHubからログアウト中…', async () => {
+    await githubApi('/api/github/logout', { method: 'POST' });
+    githubAccount = null; githubRepositories = []; $('#github-device').hidden = true;
+    renderGithubRepositories(); renderGithubAccount();
+    githubSetStatus('ログアウトしました。', 'success');
+  });
 }
 
 function githubEndpoint(settings) {
@@ -1044,7 +1192,12 @@ function githubSetStatus(message, mode = '') {
 }
 
 function setGithubControlsBusy(busy) {
-  ['github-connect','github-pull','github-commit','github-push','github-discard'].forEach(id => { $(`#${id}`).disabled = busy; });
+  const connected = Boolean(githubAccount && $('#github-owner').value && $('#github-repo').value);
+  ['github-connect','github-pull','github-commit','github-push','github-discard'].forEach(id => { $(`#${id}`).disabled = busy || !connected; });
+  $('#github-login').disabled = busy;
+  $('#github-logout').disabled = busy || !githubAccount;
+  $('#github-refresh').disabled = busy || !githubAccount;
+  $('#github-repository').disabled = busy || !githubRepositories.length;
 }
 
 function persistGithubState() {
@@ -1096,13 +1249,9 @@ async function loadGithubHistory(settings) {
 
 async function connectGithub() {
   await runGithubAction('GitHubへ接続中…', async () => {
+    if (!githubAccount && !(await refreshGithubSession())) throw new Error('先にGitHubでログインしてください。');
     const settings = githubSettings(); saveGithubSettings(settings); githubEndpoint(settings);
-    const [account, reference] = await Promise.all([
-      githubRequest('/user'),
-      githubRequest(`${githubRepoBase(settings)}/git/ref/heads/${githubEncodedBranch(settings)}`)
-    ]);
-    githubAccount = account;
-    $('#github-account').querySelector('strong').textContent = `@${account.login}`;
+    const reference = await githubRequest(`${githubRepoBase(settings)}/git/ref/heads/${githubEncodedBranch(settings)}`);
     $('#github-account').querySelector('small').textContent = `${settings.owner}/${settings.repo}・${settings.branch}・${reference.object.sha.slice(0, 7)}`;
     githubSetStatus('接続しました。プル、コミット、プッシュを実行できます。', 'success');
     await loadGithubHistory(settings);
@@ -1218,7 +1367,9 @@ document.querySelectorAll('[data-threshold-index]').forEach(input => {
 $('#threshold-copy').addEventListener('click', async () => { const value=`(${thresholdValues.join(', ')})`; try { await navigator.clipboard.writeText(value); $('#threshold-copy').textContent='コピーしました'; setTimeout(()=>$('#threshold-copy').textContent='コピー',1200); } catch { addLog('warning','クリップボードへコピーできませんでした。'); } });
 $('#threshold-insert').addEventListener('click', insertThreshold);
 
-$('#github-open').addEventListener('click',()=>{ renderGithubState(); $('#github-dialog').showModal(); });
+$('#github-open').addEventListener('click',()=>{ renderGithubState(); renderGithubAccount(); setGithubControlsBusy(false); $('#github-dialog').showModal(); void refreshGithubSession({ quiet: true }); });
+$('#github-login').addEventListener('click',startGithubLogin); $('#github-logout').addEventListener('click',logoutGithub); $('#github-refresh').addEventListener('click',()=>refreshGithubSession());
+$('#github-device-open').addEventListener('click', () => { void navigator.clipboard?.writeText($('#github-device-code').textContent).catch(() => {}); });
 $('#github-connect').addEventListener('click',connectGithub); $('#github-pull').addEventListener('click',pullFromGithub); $('#github-commit').addEventListener('click',commitToGithub); $('#github-push').addEventListener('click',pushToGithub); $('#github-discard').addEventListener('click',discardGithubCommit);
 try {
   const savedGithub=JSON.parse(localStorage.getItem('unitv-github-settings')||'{}');
@@ -1226,9 +1377,12 @@ try {
   githubPendingCommit=JSON.parse(localStorage.getItem('unitv-github-pending')||'null');
   githubRemoteBaseline=JSON.parse(localStorage.getItem('unitv-github-baseline')||'null');
 } catch { /* Invalid old settings are ignored. */ }
-['owner','repo','branch','path','message'].forEach(key => $(`#github-${key}`).addEventListener('input', () => { saveGithubSettings(githubSettings()); renderGithubState(); }));
-$('#github-token').addEventListener('input', () => { githubAccount=null; $('#github-account').querySelector('strong').textContent='未接続'; $('#github-account').querySelector('small').textContent='接続確認を実行してください'; });
-renderGithubState();
+['branch','path','message'].forEach(key => $(`#github-${key}`).addEventListener('input', () => { saveGithubSettings(githubSettings()); renderGithubState(); }));
+$('#github-repository').addEventListener('change', event => {
+  const repository = githubRepositories.find(item => item.fullName === event.target.value);
+  applyGithubRepository(repository, true); setGithubControlsBusy(false);
+});
+renderGithubAccount(); renderGithubState(); setGithubControlsBusy(false);
 $('#project-save').addEventListener('click',()=>$('#save-dialog').showModal()); $('#confirm-save').addEventListener('click',saveProject);
 $('#project-open').addEventListener('click',()=>$('#project-file').click()); $('#project-file').addEventListener('change',async event=>{try{await openProject(event.target.files[0]);}catch(error){finishWithError(`プロジェクトを開けません: ${error.message}`);}event.target.value='';});
 document.querySelectorAll('dialog').forEach(dialog => dialog.addEventListener('click', event => { if(event.target===dialog)dialog.close(); }));
