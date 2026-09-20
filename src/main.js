@@ -291,10 +291,24 @@ document.querySelector('#app').innerHTML = `
       <p class="dialog-intro">画像上をドラッグして色の範囲を選択してください。選択領域から外れ値を除いて閾値を計算します。</p>
       <div class="threshold-layout">
         <div class="threshold-stage"><canvas id="threshold-canvas"></canvas><span id="threshold-hint">ドラッグで範囲選択</span></div>
-        <div class="threshold-controls">
-          ${['L min','L max','a min','a max','b min','b max'].map((label,index)=>`<label><span>${label}</span><input type="number" data-threshold-index="${index}" ${index < 2 ? 'min="0" max="100"' : 'min="-128" max="127"'}></label>`).join('')}
-          <div class="threshold-result"><span>MaixPy形式</span><code id="threshold-value">(0, 100, -128, 127, -128, 127)</code></div>
-          <div class="threshold-stats" id="threshold-stats">画像上の対象色を選択してください。</div>
+        <div class="threshold-gauges" aria-label="LAB閾値ゲージ">
+          ${[
+            { key:'l', label:'L', description:'明るさ', min:0, max:100, low:0, high:1 },
+            { key:'a', label:'a', description:'緑 ↔ 赤', min:-128, max:127, low:2, high:3 },
+            { key:'b', label:'b', description:'青 ↔ 黄', min:-128, max:127, low:4, high:5 }
+          ].map(channel=>`<section class="threshold-gauge threshold-gauge-${channel.key}" data-threshold-pair data-low-index="${channel.low}" data-high-index="${channel.high}" data-min="${channel.min}" data-max="${channel.max}">
+            <div class="threshold-gauge-head"><span><b>${channel.label}</b>${channel.description}</span><output data-threshold-output>${channel.min} ～ ${channel.max}</output></div>
+            <div class="threshold-gauge-scale"><span>${channel.min}</span><div class="threshold-dual-range">
+              <div class="threshold-range-track" aria-hidden="true"><i></i></div>
+              <input class="threshold-range threshold-range-low" type="range" min="${channel.min}" max="${channel.max}" step="1" value="${channel.min}" data-threshold-index="${channel.low}" aria-label="${channel.label} 下限">
+              <input class="threshold-range threshold-range-high" type="range" min="${channel.min}" max="${channel.max}" step="1" value="${channel.max}" data-threshold-index="${channel.high}" aria-label="${channel.label} 上限">
+            </div><span>${channel.max}</span></div>
+          </section>`).join('')}
+          <p class="threshold-gauge-help">2つの点をドラッグして範囲を調整します。つまみを選択して矢印キーを押すと1ずつ動かせます。</p>
+          <div class="threshold-summary">
+            <div class="threshold-result"><span>MaixPy形式</span><code id="threshold-value">(0, 100, -128, 127, -128, 127)</code></div>
+            <div class="threshold-stats" id="threshold-stats">画像上の対象色を選択してください。</div>
+          </div>
         </div>
       </div>
       <div class="dialog-actions"><button type="button" class="ghost-button" id="threshold-copy">コピー</button><button type="button" class="run-button" id="threshold-insert">コードへ挿入</button></div>
@@ -347,6 +361,7 @@ let fileDeleteArmed = false;
 let thresholdValues = [0, 100, -128, 127, -128, 127];
 let thresholdSelection = null;
 let thresholdDragStart = null;
+let thresholdPreviewFrame = null;
 let githubToken = '';
 
 const editorHighlight = HighlightStyle.define([
@@ -713,6 +728,28 @@ function thresholdPoint(event) {
   return { x: Math.max(0, Math.min(canvas.width - 1, Math.round((event.clientX - bounds.left) * canvas.width / bounds.width))), y: Math.max(0, Math.min(canvas.height - 1, Math.round((event.clientY - bounds.top) * canvas.height / bounds.height))) };
 }
 
+function updateThresholdGauges() {
+  document.querySelectorAll('[data-threshold-pair]').forEach(gauge => {
+    const lowIndex = Number(gauge.dataset.lowIndex); const highIndex = Number(gauge.dataset.highIndex);
+    const min = Number(gauge.dataset.min); const max = Number(gauge.dataset.max); const span = max - min;
+    const low = thresholdValues[lowIndex]; const high = thresholdValues[highIndex];
+    gauge.style.setProperty('--threshold-low', `${(low - min) / span * 100}%`);
+    gauge.style.setProperty('--threshold-high', `${(high - min) / span * 100}%`);
+    gauge.querySelector('[data-threshold-output]').textContent = `${low} ～ ${high}`;
+    gauge.querySelector(`[data-threshold-index="${lowIndex}"]`).value = low;
+    gauge.querySelector(`[data-threshold-index="${highIndex}"]`).value = high;
+  });
+}
+
+function scheduleThresholdPreview() {
+  updateThresholdGauges();
+  if (thresholdPreviewFrame !== null) return;
+  thresholdPreviewFrame = requestAnimationFrame(() => {
+    thresholdPreviewFrame = null;
+    drawThresholdPreview();
+  });
+}
+
 function drawThresholdPreview() {
   if (!sourceImage) return;
   const canvas = $('#threshold-canvas'); canvas.width = sourceImage.width; canvas.height = sourceImage.height;
@@ -729,7 +766,7 @@ function drawThresholdPreview() {
   const total = sourceImage.width * sourceImage.height;
   $('#threshold-stats').textContent = `一致: ${matched.toLocaleString()} px（${(matched / total * 100).toFixed(1)}%）`;
   $('#threshold-value').textContent = `(${thresholdValues.join(', ')})`;
-  document.querySelectorAll('[data-threshold-index]').forEach(input => { input.value = thresholdValues[Number(input.dataset.thresholdIndex)]; });
+  updateThresholdGauges();
 }
 
 function percentile(values, ratio) {
@@ -982,7 +1019,18 @@ const thresholdCanvas = $('#threshold-canvas');
 thresholdCanvas.addEventListener('pointerdown', event => { thresholdDragStart = thresholdPoint(event); thresholdCanvas.setPointerCapture(event.pointerId); thresholdSelection = { x:thresholdDragStart.x,y:thresholdDragStart.y,width:1,height:1 }; drawThresholdPreview(); });
 thresholdCanvas.addEventListener('pointermove', event => { if (!thresholdDragStart) return; const point=thresholdPoint(event); thresholdSelection={x:Math.min(point.x,thresholdDragStart.x),y:Math.min(point.y,thresholdDragStart.y),width:Math.abs(point.x-thresholdDragStart.x)+1,height:Math.abs(point.y-thresholdDragStart.y)+1}; drawThresholdPreview(); });
 thresholdCanvas.addEventListener('pointerup', event => { if (!thresholdDragStart) return; thresholdCanvas.releasePointerCapture(event.pointerId); thresholdDragStart=null; calculateThresholdFromSelection(); });
-document.querySelectorAll('[data-threshold-index]').forEach(input => input.addEventListener('input', () => { const index=Number(input.dataset.thresholdIndex); thresholdValues[index]=Number(input.value); drawThresholdPreview(); }));
+document.querySelectorAll('[data-threshold-index]').forEach(input => {
+  const activate = () => {
+    document.querySelectorAll('.threshold-range').forEach(range => range.classList.remove('active'));
+    input.classList.add('active');
+  };
+  input.addEventListener('pointerdown', activate); input.addEventListener('focus', activate);
+  input.addEventListener('input', () => {
+    const index=Number(input.dataset.thresholdIndex); const pairIndex=index % 2 === 0 ? index + 1 : index - 1;
+    const next=Number(input.value); thresholdValues[index]=index % 2 === 0 ? Math.min(next,thresholdValues[pairIndex]) : Math.max(next,thresholdValues[pairIndex]);
+    scheduleThresholdPreview();
+  });
+});
 $('#threshold-copy').addEventListener('click', async () => { const value=`(${thresholdValues.join(', ')})`; try { await navigator.clipboard.writeText(value); $('#threshold-copy').textContent='コピーしました'; setTimeout(()=>$('#threshold-copy').textContent='コピー',1200); } catch { addLog('warning','クリップボードへコピーできませんでした。'); } });
 $('#threshold-insert').addEventListener('click', insertThreshold);
 
