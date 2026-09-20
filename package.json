@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0 --configLoader runner",
     "prepare-runtime": "node scripts/copy-runtime.mjs",
-    "build": "npm run prepare-runtime && vite build --configLoader runner && node scripts/copy-worker.mjs && node scripts/cleanup-runtime.mjs && node scripts/copy-offline-package.mjs",
+    "build": "node scripts/clean-dist.mjs && npm run prepare-runtime && vite build --configLoader runner && node scripts/copy-worker.mjs && node scripts/cleanup-runtime.mjs && node scripts/copy-offline-package.mjs",
     "preview": "vite preview --host 0.0.0.0 --configLoader runner"
   },
   "dependencies": {
