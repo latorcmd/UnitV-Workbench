@@ -10,6 +10,7 @@ import { tags } from '@lezer/highlight';
 import { MergeView } from '@codemirror/merge';
 import { unzipSync } from 'fflate';
 import { LatestBranchLoader } from './github-branch-loader.js';
+import { loadCompleteGitTree } from './github-tree.js';
 import { MaixPyIdeClient } from './maixpy-ide.js';
 import { WebSerialTransport } from './serial-transport.js';
 import {
@@ -20,7 +21,6 @@ import {
 const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_PROJECT_BYTES = 50 * 1024 * 1024;
-const MAX_PROJECT_ENTRIES = 2000;
 const EXECUTION_LIMIT_MS = 8000;
 const initialTheme = localStorage.getItem('unitv-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
 document.documentElement.dataset.theme = initialTheme;
@@ -569,21 +569,23 @@ function renderGitVersion() {
 function renderFileList() {
   const list = $('#file-list');
   list.replaceChildren();
+  const availableFiles = visibleFiles();
   const folders = new Set();
-  visibleFiles().forEach(file => {
+  availableFiles.forEach(file => {
     if (file.kind === 'folder') folders.add(file.path);
     const parts = file.path.split('/');
     for (let index = 1; index < parts.length; index += 1) folders.add(parts.slice(0, index).join('/'));
   });
   const nodes = [
     ...[...folders].map(path => ({ type: 'folder', path })),
-    ...visibleFiles().filter(file => file.kind !== 'folder').map(file => ({ type: 'file', path: file.path, file }))
+    ...availableFiles.filter(file => file.kind !== 'folder').map(file => ({ type: 'file', path: file.path, file }))
   ].sort((a, b) => {
     const aParent = a.path.includes('/') ? a.path.slice(0, a.path.lastIndexOf('/')) : '';
     const bParent = b.path.includes('/') ? b.path.slice(0, b.path.lastIndexOf('/')) : '';
     if (aParent === bParent && a.type !== b.type) return a.type === 'folder' ? -1 : 1;
     return a.path.localeCompare(b.path);
   });
+  const fragment = document.createDocumentFragment();
   nodes.forEach(node => {
     const parents = node.path.split('/').slice(0, -1);
     if (parents.some((_, index) => !expandedFolders.has(parents.slice(0, index + 1).join('/')))) return;
@@ -607,8 +609,9 @@ function renderFileList() {
     const menu = document.createElement('button');
     menu.type = 'button'; menu.className = 'file-menu'; menu.textContent = '•••'; menu.title = '名前変更・複製・削除';
     menu.addEventListener('click', () => node.type === 'folder' ? editFolder(node.path) : editFile(node.file.id));
-    row.append(open, menu); list.append(row);
+    row.append(open, menu); fragment.append(row);
   });
+  list.append(fragment);
   renderGitVersion();
 }
 
@@ -1343,7 +1346,6 @@ async function openProject(file) {
   const reusableGithubSource = data.version >= 3 && data.source?.type === 'github' && data.source.owner && data.source.repo && data.source.branch && data.source.headSha;
   const importedProject=createProject(uniqueProjectName(data.name || file.name.replace(/\.unitvproj$/i,'')), reusableGithubSource ? data.source : {type:'local'});
   const rawEntries = data.version >= 3 && Array.isArray(data.entries) ? data.entries : data.version === 2 && Array.isArray(data.files) ? data.files.map(item=>({path:item.name,kind:'text',text:item.code})) : [{path:'main.py',kind:'text',text:String(data.code||'')}];
-  if (rawEntries.length > MAX_PROJECT_ENTRIES) throw new Error(`ファイル数が上限の${MAX_PROJECT_ENTRIES}件を超えています。`);
   const imported=[]; let importedBytes=0;
   for (const [index,item] of rawEntries.entries()) {
     const path=normalizeProjectPath(item.path || `file-${index+1}.txt`);
@@ -1653,18 +1655,29 @@ function base64ToBytes(value) {
 
 async function blobToBase64(blob) { return bytesToBase64(new Uint8Array(await blob.arrayBuffer())); }
 
-async function fetchRepositorySnapshot(settings) {
+function describeRepositoryProgress(progress) {
+  if (progress.phase === 'tree-walk') return `大規模リポジトリを走査しています… ${progress.entries.toLocaleString('ja-JP')}項目`;
+  if (progress.phase === 'archive') return 'リポジトリ本体をダウンロードしています…';
+  if (progress.phase === 'unpack') return `ファイルを展開しています… ${progress.current.toLocaleString('ja-JP')} / ${progress.total.toLocaleString('ja-JP')}`;
+  return 'ファイル一覧を取得しています…';
+}
+
+async function fetchRepositorySnapshot(settings, onProgress = () => {}) {
   const repo = githubRepoBase(settings); const branch = githubEncodedBranch(settings);
   const reference = await githubRequest(`${repo}/git/ref/heads/${branch}`);
   const commit = await githubRequest(`${repo}/git/commits/${reference.object.sha}`);
-  const tree = await githubRequest(`${repo}/git/trees/${commit.tree.sha}?recursive=1`);
-  if (tree.truncated) throw new Error('リポジトリが大きすぎるため一覧を完全に取得できません。');
-  const tracked = (tree.tree || []).filter(item => item.type === 'blob' || item.type === 'commit');
-  if (tracked.length > MAX_PROJECT_ENTRIES) throw new Error(`ファイル数が上限の${MAX_PROJECT_ENTRIES}件を超えています。`);
+  onProgress({ phase:'tree' });
+  const treeEntries = await loadCompleteGitTree({
+    rootSha:commit.tree.sha,
+    getTree:(sha, recursive) => githubRequest(`${repo}/git/trees/${sha}${recursive ? '?recursive=1' : ''}`),
+    onProgress:progress => onProgress({ phase:progress.mode === 'walk' ? 'tree-walk' : 'tree', ...progress })
+  });
+  const tracked = treeEntries.filter(item => item.type === 'blob' || item.type === 'commit');
   const declaredBytes = tracked.reduce((total, item) => total + (Number(item.size) || 0), 0);
   if (declaredBytes > MAX_PROJECT_BYTES) throw new Error('プロジェクトの合計サイズが50 MBを超えています。');
   const oversizedImage = tracked.find(item => imageMime(item.path) && Number(item.size) > MAX_IMAGE_BYTES);
   if (oversizedImage) throw new Error(`${oversizedImage.path} は画像上限の15 MBを超えています。`);
+  onProgress({ phase:'archive', total:tracked.length });
   const archiveResponse = await githubRequestRaw(`${repo}/zipball/${branch}`);
   const archive = new Uint8Array(await archiveResponse.arrayBuffer());
   if (archive.byteLength > MAX_PROJECT_BYTES) throw new Error('リポジトリのダウンロードサイズが50 MBを超えています。');
@@ -1672,10 +1685,16 @@ async function fetchRepositorySnapshot(settings) {
   const archiveNames = Object.keys(unpacked).filter(name => !name.endsWith('/'));
   const archiveFiles = new Map(archiveNames.map(name => [name.split('/').slice(1).join('/'), unpacked[name]]));
   const entries = []; let totalBytes = 0;
+  const reportUnpackProgress = async current => {
+    if (current % 250 !== 0) return;
+    onProgress({ phase:'unpack', current, total:tracked.length });
+    await sleep(0);
+  };
   for (const [order, item] of tracked.entries()) {
     const path = normalizeProjectPath(item.path);
     if (item.type === 'commit') {
       entries.push({ path, kind:'submodule', size:0, mode:item.mode, basePath:path, baseSha:item.sha, order });
+      await reportUnpackProgress(order + 1);
       continue;
     }
     const bytes = archiveFiles.get(path);
@@ -1686,6 +1705,7 @@ async function fetchRepositorySnapshot(settings) {
     if (mime) {
       if (bytes.byteLength > MAX_IMAGE_BYTES) throw new Error(`${path} は画像上限の15 MBを超えています。`);
       entries.push({ path, kind:'image', blob:new Blob([bytes], { type:mime }), mime, size:bytes.byteLength, mode:item.mode, basePath:path, baseSha:item.sha, order });
+      await reportUnpackProgress(order + 1);
       continue;
     }
     if (bytes.byteLength > MAX_TEXT_BYTES) {
@@ -1702,7 +1722,9 @@ async function fetchRepositorySnapshot(settings) {
     }
     if (text !== null) entries.push({ path, kind:'text', text, size:bytes.byteLength, mode:item.mode, basePath:path, baseSha:item.sha, baseText:text, order });
     else entries.push({ path, kind:'binary', blob:new Blob([bytes], { type:'application/octet-stream' }), mime:'application/octet-stream', size:bytes.byteLength, mode:item.mode, basePath:path, baseSha:item.sha, order });
+    await reportUnpackProgress(order + 1);
   }
+  onProgress({ phase:'unpack', current:tracked.length, total:tracked.length });
   return { entries, headSha:reference.object.sha, treeSha:commit.tree.sha };
 }
 
@@ -1710,7 +1732,7 @@ async function cloneFromGithub() {
   await runGithubAction('リポジトリをクローンしています…', async () => {
     if (!githubAccount && !(await refreshGithubSession())) throw new Error('先にGitHubへログインしてください。');
     const settings = githubSettings(); saveGithubSettings(settings);
-    const snapshot = await fetchRepositorySnapshot(settings);
+    const snapshot = await fetchRepositorySnapshot(settings, progress => githubSetStatus(describeRepositoryProgress(progress), 'busy'));
     const source = { type:'github', owner:settings.owner, repo:settings.repo, branch:settings.branch, headSha:snapshot.headSha, treeSha:snapshot.treeSha, lastSyncAt:new Date().toISOString(), pendingCommit:null };
     const project = createProject(uniqueProjectName(settings.repo), source);
     const entries = snapshot.entries.map(item => createEntry({ projectId:project.id, ...item }));
@@ -1727,7 +1749,7 @@ async function pullFromGithub() {
     await persistCurrentFile();
     if (githubPendingCommit) throw new Error('未プッシュのコミットがあります。先にプッシュするか破棄してください。');
     if (hasLocalChanges()) throw new Error('未コミットの変更があります。コミットするか変更を戻してからプルしてください。');
-    const settings = linkedGithubSettings(); const snapshot = await fetchRepositorySnapshot(settings);
+    const settings = linkedGithubSettings(); const snapshot = await fetchRepositorySnapshot(settings, progress => githubSetStatus(describeRepositoryProgress(progress), 'busy'));
     const entries = snapshot.entries.map(item => createEntry({ projectId:currentProject.id, ...item }));
     currentProject.source = { ...currentProject.source, headSha:snapshot.headSha, treeSha:snapshot.treeSha, lastSyncAt:new Date().toISOString(), pendingCommit:null };
     currentProject.activePath = entries.some(entry => entry.path === currentProject.activePath) ? currentProject.activePath : entries.find(entry => entry.kind === 'text')?.path || entries[0]?.path || '';
@@ -1853,8 +1875,9 @@ async function openHistoricalVersion(settings, summary) {
   const dialog = $('#version-dialog'); const treePanel = $('#version-tree'); const preview = $('#version-preview');
   $('#version-title').textContent = `${summary.sha.slice(0, 7)} — ${summary.commit.message.split('\n')[0]}`; treePanel.textContent = 'ファイル一覧を取得しています…'; preview.innerHTML = '<p>ファイルを選択してください。</p>'; dialog.showModal();
   try {
-    const commit = await githubRequest(`${githubRepoBase(settings)}/git/commits/${summary.sha}`); const tree = await githubRequest(`${githubRepoBase(settings)}/git/trees/${commit.tree.sha}?recursive=1`);
-    treePanel.replaceChildren(); (tree.tree || []).filter(item => item.type === 'blob').forEach(item => {
+    const repo = githubRepoBase(settings); const commit = await githubRequest(`${repo}/git/commits/${summary.sha}`);
+    const treeEntries = await loadCompleteGitTree({ rootSha:commit.tree.sha, getTree:(sha, recursive) => githubRequest(`${repo}/git/trees/${sha}${recursive ? '?recursive=1' : ''}`) });
+    treePanel.replaceChildren(); treeEntries.filter(item => item.type === 'blob').forEach(item => {
       const button = document.createElement('button'); button.type = 'button'; button.textContent = item.path; button.style.setProperty('--tree-depth', item.path.split('/').length - 1);
       button.addEventListener('click', async () => {
         preview.textContent = '読み込み中…';
