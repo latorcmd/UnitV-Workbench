@@ -430,7 +430,7 @@ function addLog(level, text, time = new Date().toLocaleTimeString('ja-JP', { hou
   line.innerHTML = `<span class="time">${time}</span><span class="log-tag">[${level}]</span><span class="log-text"></span>`;
   line.querySelector('.log-text').textContent = safeText || ' ';
   refs.terminal.append(line);
-  while (refs.terminal.children.length > 1000) refs.terminal.firstElementChild?.remove();
+  while (refs.terminal.children.length > 300) refs.terminal.firstElementChild?.remove();
   refs.terminal.scrollTop = refs.terminal.scrollHeight;
 }
 
