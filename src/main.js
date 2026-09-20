@@ -1,7 +1,7 @@
 import './styles.css';
 import { EditorState, RangeSetBuilder } from '@codemirror/state';
 import { EditorView, Decoration, ViewPlugin, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection } from '@codemirror/view';
-import { HighlightStyle, bracketMatching, foldGutter, indentUnit, syntaxHighlighting, syntaxTree } from '@codemirror/language';
+import { HighlightStyle, bracketMatching, ensureSyntaxTree, foldGutter, indentUnit, syntaxHighlighting, syntaxTree } from '@codemirror/language';
 import { python } from '@codemirror/lang-python';
 import { lintGutter, linter } from '@codemirror/lint';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
@@ -186,7 +186,7 @@ document.querySelector('#app').innerHTML = `
       <button class="sample-image-button camera-button" id="camera-toggle" type="button">カメラを開始</button>
       <button class="sample-image-button" id="threshold-open" type="button" disabled>LAB閾値</button>
       <div class="control-divider"></div>
-      <div class="run-copy"><span class="step">02</span><span><strong>コードを実行</strong><small>実行上限 8秒</small></span></div>
+      <div class="run-copy"><span class="step">02</span><span><strong>コードを実行</strong><small id="execution-limit-note">静止画像は実行上限 8秒</small></span></div>
       <button class="run-button" id="run" type="button"><span>▶</span> 実行</button>
       <button class="stop-button" id="stop" type="button" disabled>■ 停止</button>
       <div class="runtime-state" id="runtime-state"><span></span><div><strong>準備完了</strong><small>画像を選択してください</small></div></div>
@@ -265,7 +265,7 @@ document.querySelector('#app').innerHTML = `
         <section><h3>image</h3><p>resize / crop / copy / binary / find_blobs / draw_rectangle / draw_line / draw_circle / draw_cross / draw_string</p></section>
         <section><h3>UART・I/O</h3><p>UART read / readline / readchar / write / any、GPIO value、ws2812 set_led / display</p></section>
         <section><h3>カメラ設定</h3><p>レジスタ読書き、auto gain / exposure / white balance、brightness / saturation / contrast、windowing</p></section>
-      </div><p class="dialog-note">固定画像モードではトップレベルの while(True) を1フレームだけ実行します。KPUは未対応です。</p>
+      </div><p class="dialog-note">静止画像ではトップレベルの while(True) を1フレームだけ実行します。カメラでは各 snapshot() で新しいフレームを取得し、停止まで連続実行します。KPUは未対応です。</p>
     </form>
   </dialog>
 
@@ -336,6 +336,7 @@ let running = false;
 let gpioState = { GPIO1: 0, GPIO2: 0, GPIOHS0: 0 };
 let uartQueued = new Uint8Array();
 let cameraStream = null;
+let lastCameraCaptureAt = 0;
 let editorView = null;
 let files = [];
 let currentFileId = null;
@@ -390,7 +391,8 @@ const indentGuides = ViewPlugin.fromClass(class {
 
 function syntaxDiagnostics(view) {
   const diagnostics = [];
-  syntaxTree(view.state).iterate({
+  const tree = ensureSyntaxTree(view.state, view.state.doc.length, 100) || syntaxTree(view.state);
+  tree.iterate({
     enter(node) {
       if (!node.type.isError) return;
       const from = Math.min(node.from, Math.max(0, view.state.doc.length - 1));
@@ -427,7 +429,9 @@ function addLog(level, text, time = new Date().toLocaleTimeString('ja-JP', { hou
   const safeText = String(text).replace(/\n$/, '');
   line.innerHTML = `<span class="time">${time}</span><span class="log-tag">[${level}]</span><span class="log-text"></span>`;
   line.querySelector('.log-text').textContent = safeText || ' ';
-  refs.terminal.append(line); refs.terminal.scrollTop = refs.terminal.scrollHeight;
+  refs.terminal.append(line);
+  while (refs.terminal.children.length > 1000) refs.terminal.firstElementChild?.remove();
+  refs.terminal.scrollTop = refs.terminal.scrollHeight;
 }
 
 function setRuntime(state, detail, mode = '') {
@@ -566,7 +570,7 @@ async function initializeEditor() {
       doc: active.code,
       extensions: [
         lineNumbers(), highlightActiveLineGutter(), history(), foldGutter(), drawSelection(), highlightActiveLine(),
-        indentUnit.of('    '), python(), bracketMatching(), closeBrackets(), EditorView.lineWrapping,
+        indentUnit.of('    '), python(), bracketMatching(), closeBrackets(),
         syntaxHighlighting(editorHighlight), indentGuides, lintGutter(), linter(syntaxDiagnostics, { delay: 250 }),
         keymap.of([
           { key: 'Mod-Enter', run: () => { runCode(); return true; } },
@@ -622,14 +626,37 @@ async function loadSampleImage() {
   }
 }
 
-async function captureCameraFrame() {
+async function captureCameraFrame(waitForFreshFrame = false, updateSavedImage = true) {
   if (!cameraStream || refs.camera.readyState < 2) throw new Error('カメラの映像を準備中です。少し待ってから再実行してください。');
+  if (waitForFreshFrame) {
+    const delay = Math.max(0, 90 - (performance.now() - lastCameraCaptureAt));
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    if (typeof refs.camera.requestVideoFrameCallback === 'function') {
+      await Promise.race([
+        new Promise(resolve => refs.camera.requestVideoFrameCallback(() => resolve())),
+        new Promise(resolve => setTimeout(resolve, 250))
+      ]);
+    }
+  }
   const width = refs.camera.videoWidth; const height = refs.camera.videoHeight;
   const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height;
   const context = canvas.getContext('2d', { willReadFrequently: true }); context.drawImage(refs.camera, 0, 0, width, height);
-  sourceImage = context.getImageData(0, 0, width, height); sourceImageDataUrl = canvas.toDataURL('image/jpeg', .9); sourceImageName = 'camera-frame.jpg';
+  sourceImage = context.getImageData(0, 0, width, height); sourceImageName = 'camera-frame.jpg'; lastCameraCaptureAt = performance.now();
+  if (updateSavedImage) sourceImageDataUrl = canvas.toDataURL('image/jpeg', .9);
   $('#threshold-open').disabled = false;
   return sourceImage;
+}
+
+async function replyWithCameraFrame(requestId) {
+  const targetWorker = worker;
+  try {
+    const frame = await captureCameraFrame(true, false);
+    if (!targetWorker || worker !== targetWorker) return;
+    const data = new Uint8ClampedArray(frame.data);
+    targetWorker.postMessage({ type:'camera-frame', requestId, image:{ width:frame.width, height:frame.height, data:data.buffer } }, [data.buffer]);
+  } catch (error) {
+    if (targetWorker && worker === targetWorker) targetWorker.postMessage({ type:'camera-frame-error', requestId, message:error.message });
+  }
 }
 
 async function startCamera() {
@@ -638,20 +665,22 @@ async function startCamera() {
   refs.camera.srcObject = cameraStream; await refs.camera.play();
   refs.camera.hidden = false; refs.canvas.hidden = true; refs.empty.hidden = true;
   $('#camera-toggle').textContent = 'カメラを停止'; $('#camera-toggle').classList.add('active');
+  $('#execution-limit-note').textContent = 'カメラ時は停止まで連続実行';
   refs.imageLabel.textContent = 'リアルタイムカメラ'; refs.imageDetail.textContent = '実行時のフレームを使用・端末内のみ'; refs.frameMeta.textContent = `${refs.camera.videoWidth} × ${refs.camera.videoHeight} LIVE`;
-  setRuntime('カメラ入力', '「実行」で現在のフレームを処理します', 'success'); addLog('system', '端末カメラを開始しました。映像はサーバーへ送信されません。');
+  setRuntime('カメラ入力', 'snapshot()ごとに新しいフレームを取得します', 'success'); addLog('system', '端末カメラを開始しました。snapshot()ごとに新しいフレームを取得します。映像はサーバーへ送信されません。');
 }
 
 function stopCamera(showLastFrame = true) {
   cameraStream?.getTracks().forEach(track => track.stop()); cameraStream = null; refs.camera.srcObject = null; refs.camera.hidden = true;
   $('#camera-toggle').textContent = 'カメラを開始'; $('#camera-toggle').classList.remove('active');
+  $('#execution-limit-note').textContent = '静止画像は実行上限 8秒';
   if (showLastFrame && sourceImage) drawFrame(sourceImage);
   addLog('system', 'カメラを停止しました。');
 }
 
 async function toggleCamera() {
   try {
-    if (cameraStream) { stopCamera(); return; }
+    if (cameraStream) { if (running) stopExecution('カメラを停止したため実行を終了しました。'); stopCamera(); return; }
     await startCamera();
   } catch (error) { finishWithError(`カメラを開始できません: ${error.message}`); }
 }
@@ -758,11 +787,19 @@ function ensureWorker() {
 
 function handleWorkerMessage(event) {
   const msg = event.data;
-  if (msg.type === 'status') {
-    const states = { 'loading-python':['Pythonを準備中',msg.text], 'loading-model':['モデルを準備中',msg.text], executing:['実行中',`最大${EXECUTION_LIMIT_MS/1000}秒で停止します`] };
+  if (msg.type === 'camera-frame-request') {
+    replyWithCameraFrame(msg.requestId); return;
+  } else if (msg.type === 'frame') {
+    if (running) {
+      drawFrame(new ImageData(new Uint8ClampedArray(msg.data), msg.width, msg.height));
+      setRuntime('カメラ実行中', '停止ボタンを押すまで連続処理します', 'busy');
+    }
+  } else if (msg.type === 'status') {
+    const states = { 'loading-python':['Pythonを準備中',msg.text], 'loading-model':['モデルを準備中',msg.text], executing:['実行中',msg.liveCamera?'停止ボタンを押すまで連続処理します':`最大${EXECUTION_LIMIT_MS/1000}秒で停止します`] };
     const state = states[msg.phase] || ['処理中',msg.text || '']; setRuntime(state[0], state[1], 'busy');
     if (msg.phase === 'executing') {
-      clearTimeout(executionTimer); executionTimer = setTimeout(() => stopExecution('実行時間が8秒を超えたため停止しました。'), EXECUTION_LIMIT_MS);
+      clearTimeout(executionTimer); executionTimer = null;
+      if (!msg.liveCamera) executionTimer = setTimeout(() => stopExecution('実行時間が8秒を超えたため停止しました。'), EXECUTION_LIMIT_MS);
     }
   } else if (msg.type === 'log') {
     addLog(msg.level || 'stdout', msg.text, msg.time);
@@ -808,7 +845,7 @@ async function runCode() {
   const imageCopy = new Uint8ClampedArray(sourceImage.data);
   const uartCopy = new Uint8Array(uartQueued);
   const activeFile = files.find(file => file.id === currentFileId);
-  const payload = { type:'run', code:getCode(), filename:activeFile?.name || 'main.py', files:files.map(file=>({name:file.name,code:file.id===currentFileId?getCode():file.code})), image:{width:sourceImage.width,height:sourceImage.height,data:imageCopy.buffer}, uart:uartCopy.buffer, gpio:{...gpioState} };
+  const payload = { type:'run', code:getCode(), filename:activeFile?.name || 'main.py', files:files.map(file=>({name:file.name,code:file.id===currentFileId?getCode():file.code})), cameraMode:Boolean(cameraStream), image:{width:sourceImage.width,height:sourceImage.height,data:imageCopy.buffer}, uart:uartCopy.buffer, gpio:{...gpioState} };
   const transfers = [imageCopy.buffer, uartCopy.buffer];
   ensureWorker().postMessage(payload, transfers);
 }

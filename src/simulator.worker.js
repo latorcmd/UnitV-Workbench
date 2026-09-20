@@ -18,10 +18,26 @@ let gpio = {};
 let ledState = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
 let inference = null;
 let pyodide = null;
+let liveCameraMode = false;
+let cameraRequestSequence = 0;
+const cameraFrameRequests = new Map();
 
 const clamp = (n, min = 0, max = 255) => Math.max(min, Math.min(max, Number(n) || 0));
 const post = (type, payload = {}) => self.postMessage({ type, ...payload });
 const stamp = () => new Date().toLocaleTimeString('ja-JP', { hour12: false });
+
+function emitLiveFrame() {
+  if (!liveCameraMode || !latestFrame) return;
+  const data = new Uint8ClampedArray(latestFrame.data);
+  self.postMessage({ type:'frame', width:latestFrame.width, height:latestFrame.height, data:data.buffer }, [data.buffer]);
+}
+
+function requestCameraFrame() {
+  emitLiveFrame();
+  const requestId = ++cameraRequestSequence;
+  post('camera-frame-request', { requestId });
+  return new Promise((resolve, reject) => cameraFrameRequests.set(requestId, { resolve, reject }));
+}
 
 function toJs(value) {
   if (value == null) return value;
@@ -323,6 +339,7 @@ async function runInference(modelBuffer, config) {
 
 function buildBridge() {
   return {
+    requestCameraFrame,
     sensorReset: () => { targetSize=FRAME_SIZES.QVGA; windowing=null; hmirror=false; vflip=false; brightness=0; saturation=0; contrast=0; registers={}; return true; },
     setFrameSize: value => { const v=toJs(value); targetSize = Array.isArray(v) ? v.map(Number) : (FRAME_SIZES[String(v)] || FRAME_SIZES.QVGA); },
     setWindowing: value => { windowing=Array.from(toJs(value),Number); },
@@ -417,6 +434,10 @@ sensor.set_contrast=lambda value,*a,**k: bridge.setContrast(value)
 sensor.__read_reg=lambda address: int(bridge.readRegister(address))
 sensor.__write_reg=lambda address,value: bridge.writeRegister(address,value)
 sensor.snapshot=lambda: SimImage(bridge.snapshot())
+async def _snapshot_async():
+    await bridge.requestCameraFrame()
+    return sensor.snapshot()
+sensor.snapshot_async=_snapshot_async
 sys.modules['sensor']=sensor
 
 class Clock:
@@ -515,16 +536,31 @@ async function ensurePython() {
   return pyodide;
 }
 
-function prepareCode(code) {
+function prepareCode(code, cameraMode = false) {
+  if (cameraMode) {
+    const prepared = String(code).replace(/\bsensor\s*\.\s*snapshot\s*\(\s*\)/g, 'await sensor.snapshot_async()');
+    return { prepared, limited:false };
+  }
   let limited = false;
   const prepared = String(code).replace(/^while\s*\(?\s*True\s*\)?\s*:/gm, () => { limited = true; return 'for __unitv_browser_frame in range(1):'; });
   return { prepared, limited };
 }
 
 self.onmessage = async event => {
-  if (event.data?.type !== 'run') return;
   const payload = event.data;
+  if (payload?.type === 'camera-frame') {
+    const pending = cameraFrameRequests.get(payload.requestId); if (!pending) return;
+    cameraFrameRequests.delete(payload.requestId);
+    sourceFrame = { width:payload.image.width, height:payload.image.height, data:new Uint8ClampedArray(payload.image.data) };
+    pending.resolve(true); return;
+  }
+  if (payload?.type === 'camera-frame-error') {
+    const pending = cameraFrameRequests.get(payload.requestId); if (!pending) return;
+    cameraFrameRequests.delete(payload.requestId); pending.reject(new Error(payload.message || 'カメラフレームを取得できませんでした。')); return;
+  }
+  if (payload?.type !== 'run') return;
   try {
+    liveCameraMode = Boolean(payload.cameraMode);
     sourceFrame = { width: payload.image.width, height: payload.image.height, data: new Uint8ClampedArray(payload.image.data) };
     latestFrame = cloneFrame(sourceFrame); targetSize = FRAME_SIZES.QVGA; windowing=null; hmirror=false; vflip=false; brightness=0; saturation=0; contrast=0; registers={};
     uartQueue = Array.from(new Uint8Array(payload.uart || new ArrayBuffer(0)));
@@ -538,13 +574,16 @@ self.onmessage = async event => {
       const moduleName = file.name.replace(/\.py$/, '');
       await runtime.runPythonAsync(`import sys\nsys.modules.pop(${JSON.stringify(moduleName)}, None)`);
     }
-    post('status', { phase: 'executing', text: 'コードを実行しています' });
-    const { prepared, limited } = prepareCode(payload.code);
+    post('status', { phase: 'executing', text: liveCameraMode ? 'カメラフレームを連続処理しています' : 'コードを実行しています', liveCamera:liveCameraMode });
+    const { prepared, limited } = prepareCode(payload.code, liveCameraMode);
     if (limited) post('log',{level:'system',text:'固定画像モードのため while(True) を1フレームだけ実行します。',time:stamp()});
+    if (liveCameraMode) post('log',{level:'system',text:'カメラモード: while(True) を維持し、sensor.snapshot() ごとに新しいフレームを取得します。停止ボタンで終了できます。',time:stamp()});
     await runtime.runPythonAsync(prepared, { filename: payload.filename || 'main.py' });
     const frame = latestFrame || sourceFrame;
+    liveCameraMode = false;
     post('result', { width:frame.width,height:frame.height,data:frame.data.buffer,gpio,leds:ledState }, [frame.data.buffer]);
   } catch (error) {
+    liveCameraMode = false;
     const message = String(error?.message || error);
     const stack = String(error?.stack || '');
     post('error', { message: message === 'PythonError' && stack ? stack : message, stack });
