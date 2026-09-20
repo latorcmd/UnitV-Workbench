@@ -107,9 +107,14 @@ h1, h2, p { margin: 0; }
 .gpio-bank small, .gpio-bank b { display: block; font-size: 10px; }.gpio-bank b { margin-top: 3px; color: #66808a; }
 .led-bank i { width: 20px; height: 20px; border: 1px solid #34505c; border-radius: 50%; background: #13232a; box-shadow: inset 0 0 7px #000; }
 
+@media (max-width: 1500px) {
+  .control-strip { flex-wrap:wrap; }
+  .upload-card { min-width:min(310px,100%); }
+  .runtime-state { margin-left:0; }
+}
 @media (max-width: 1050px) {
   .topbar { height: auto; padding: 16px 0; align-items: flex-start; gap: 16px; }.top-actions { flex-wrap: wrap; justify-content: flex-end; }.privacy-pill { width: 100%; justify-content: flex-end; }
-  .control-strip { flex-wrap: wrap; }.runtime-state { margin-left: 0; }.control-divider { display: none; }
+  .control-divider { display: none; }
   .workspace { grid-template-columns: 1fr; }.right-stack { grid-template-rows: minmax(320px, 52vh) 260px; }.fake-editor { min-height: 500px; }.io-dock { grid-template-columns: 130px 1fr; }.gpio-bank, .led-bank { grid-column: span 1; }
 }
 @media (max-width: 680px) {
