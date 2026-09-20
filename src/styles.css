@@ -260,6 +260,42 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .github-history { margin-top:14px; }.github-history h3 { margin:0 0 7px; color:var(--muted); font-size:10px; letter-spacing:.1em; text-transform:uppercase; }.github-history>div { display:grid; gap:5px; color:var(--muted); font-size:11px; }.github-history>div>div { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 10px; border:1px solid var(--line); border-radius:7px; background:#071119; }.github-history strong { min-width:0; color:var(--text); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.github-history small { flex:0 0 auto; color:var(--muted); font:9px "Cascadia Code",monospace; }
 .dialog-field { display:grid; gap:6px; margin-bottom:14px; color:var(--muted); font-size:11px; }.dialog-field input { width:100%; border:1px solid var(--line); border-radius:7px; background:#071119; color:var(--text); padding:11px 12px; font:13px "Cascadia Code",monospace; }.file-dialog-actions .danger-button { margin-right:auto; }.danger-button { border:1px solid #7b3540; border-radius:7px; background:#32181d; color:#ff9aa5; padding:9px 12px; }
 
+/* Project explorer, full-screen editor and Git views */
+.project-switcher { min-width:170px; display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:7px; padding:4px 8px; border:1px solid var(--line); border-radius:7px; background:var(--surface); }
+.project-switcher span { color:var(--cyan); font:700 8px/1 ui-monospace,monospace; letter-spacing:.1em; }
+.project-switcher select { min-width:0; max-width:190px; border:0; outline:0; background:transparent; color:var(--text); font-size:11px; }
+.git-version { max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:4px 7px; border:1px solid var(--line); border-radius:999px; color:var(--muted); font:700 9px/1 "Cascadia Code",monospace; }
+.git-version.changed { border-color:#85652f; color:var(--amber); }
+.file-row { padding-left:calc(var(--tree-depth, 0) * 13px); }
+.file-open { grid-template-columns:25px minmax(0,1fr) 16px; }
+.file-open i { color:var(--amber); font:800 10px/1 "Cascadia Code",monospace; text-align:center; }
+.file-row.folder .file-open span { color:var(--cyan); font-size:11px; }
+.asset-viewer,.binary-viewer { min-width:0; min-height:0; height:100%; overflow:auto; place-items:center; align-content:center; gap:18px; padding:24px; background-color:#061017; background-image:linear-gradient(#ffffff07 1px,transparent 1px),linear-gradient(90deg,#ffffff07 1px,transparent 1px); background-size:18px 18px; }
+.asset-viewer { display:grid; }.binary-viewer { display:grid; text-align:center; }
+.asset-viewer img { max-width:100%; max-height:calc(100% - 80px); object-fit:contain; border:1px solid var(--line); box-shadow:0 12px 32px #0008; }
+.asset-viewer>div { display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:9px 14px; }
+.asset-viewer small,.binary-viewer small { color:var(--muted); font:11px "Cascadia Code",monospace; }
+.asset-viewer button { padding:8px 11px; border:1px solid #277f78; border-radius:7px; background:#0c292a; color:var(--cyan); }
+body.has-editor-fullscreen { overflow:hidden; }
+.code-panel.editor-fullscreen { position:fixed; z-index:1000; inset:10px; display:grid; grid-template-rows:auto minmax(0,1fr); border-color:#3a5b67; box-shadow:0 30px 100px #000d; }
+.code-panel.editor-fullscreen .editor-workspace { width:100%; height:100%; min-height:0; }
+.diff-dialog,.version-dialog { width:min(1240px,calc(100vw - 24px)); max-width:none; height:min(820px,calc(100dvh - 24px)); max-height:none; }
+.diff-dialog form,.version-dialog form { height:100%; display:grid; grid-template-rows:auto minmax(0,1fr) auto; overflow:hidden; }
+.version-dialog form { grid-template-rows:auto minmax(0,1fr); }
+.diff-layout,.version-layout { min-width:0; min-height:0; display:grid; grid-template-columns:260px minmax(0,1fr); gap:12px; overflow:hidden; }
+.diff-layout>aside,.version-layout>aside { min-width:0; min-height:0; overflow:auto; border:1px solid var(--line); border-radius:8px; background:#071119; }
+.diff-layout>section { min-width:0; min-height:0; display:grid; grid-template-rows:38px minmax(0,1fr); overflow:hidden; border:1px solid var(--line); border-radius:8px; background:#071119; }
+.diff-list-head,.diff-title { display:flex; align-items:center; justify-content:space-between; gap:8px; min-height:38px; padding:7px 10px; border-bottom:1px solid var(--line); color:var(--muted); font-size:10px; }
+.diff-list-head button { border:0; background:transparent; color:var(--cyan); font-size:10px; }
+.diff-file-list { padding:6px; }.diff-file-list label { display:grid; grid-template-columns:20px minmax(0,1fr) 18px; align-items:center; gap:5px; padding:3px; border-radius:5px; }.diff-file-list label:hover { background:#12232c; }
+.diff-file-list input { accent-color:var(--cyan); }.diff-file-list button { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:7px 4px; border:0; background:transparent; color:var(--text); text-align:left; font:11px "Cascadia Code",monospace; }.diff-file-list b { color:var(--amber); font:800 10px "Cascadia Code",monospace; }
+#diff-editor { min-width:0; min-height:0; overflow:hidden; }#diff-editor .cm-mergeView { height:100%; }#diff-editor .cm-mergeViewEditors { height:100%; min-width:0; }#diff-editor .cm-editor { height:100%; min-width:0; background:#08131a; font:12px/1.6 "Cascadia Code",monospace; }#diff-editor .cm-scroller { overflow:auto; }
+.diff-asset { min-height:0; overflow:auto; padding:20px; color:var(--muted); }.diff-asset img { display:block; max-width:100%; max-height:60vh; margin:18px auto 0; object-fit:contain; }
+.version-layout>section { min-width:0; min-height:0; overflow:auto; padding:16px; border:1px solid var(--line); border-radius:8px; background:#071119; }
+#version-tree { padding:6px; }#version-tree button { display:block; width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:8px 8px 8px calc(8px + var(--tree-depth, 0) * 12px); border:0; border-radius:5px; background:transparent; color:var(--text); text-align:left; font:11px "Cascadia Code",monospace; }#version-tree button:hover { background:#12232c; color:var(--cyan); }
+#version-preview pre { min-width:max-content; margin:0; color:var(--text); font:12px/1.6 "Cascadia Code",monospace; white-space:pre; }#version-preview img { display:block; max-width:100%; max-height:100%; margin:auto; object-fit:contain; }
+.github-history>div>button { width:100%; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 10px; border:1px solid var(--line); border-radius:7px; background:#071119; color:var(--text); text-align:left; }.github-history>div>button:hover { border-color:#3a5662; }.github-history>div>button strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.github-history>div>button small { flex:0 0 auto; color:var(--muted); font:9px "Cascadia Code",monospace; }
+
 /* Light theme */
 :root[data-theme="light"] {
   color-scheme: light; --bg:#eef3f5; --surface:#ffffff; --surface-2:#f5f8f9; --line:#cdd9dd; --muted:#61747d; --text:#18282f; --cyan:#008f86; --amber:#b65f00; --danger:#c93645;
@@ -289,9 +325,12 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 :root[data-theme="light"] .threshold-source-picker button.active { background:#ddf2f0; }
 :root[data-theme="light"] .danger-button { background:#fff0f1; color:#ad2434; border-color:#e3aeb4; }
 :root[data-theme="light"] #threshold-hint { background:#ffffffdf; color:#334950; }
+:root[data-theme="light"] .project-switcher,:root[data-theme="light"] .asset-viewer,:root[data-theme="light"] .binary-viewer,:root[data-theme="light"] .diff-layout>aside,:root[data-theme="light"] .diff-layout>section,:root[data-theme="light"] .version-layout>aside,:root[data-theme="light"] .version-layout>section,:root[data-theme="light"] #diff-editor .cm-editor,:root[data-theme="light"] .github-history>div>button { background:#f7fafb; }
+:root[data-theme="light"] .asset-viewer button { background:#ddf2f0; color:#08756e; }
 
 @media (max-width:1050px) { .editor-workspace { height:540px; } }
 @media (max-width:680px) {
   .editor-workspace { height:520px; grid-template-columns:112px minmax(0,1fr); }.file-open { grid-template-columns:20px minmax(0,1fr); padding-left:3px; }.file-sidebar>small { display:none; }
   .editor-status { gap:8px; }.editor-status span:last-child { display:none; }.github-grid { grid-template-columns:1fr; }.github-message-field,.github-repository-field { grid-column:1; }.github-auth-bar { grid-template-columns:1fr auto; }.github-auth-bar a { grid-row:2; }.github-auth-bar button { grid-column:2; }.github-repository-actions { display:grid; grid-template-columns:1fr 1fr; }.github-worktree { grid-template-columns:1fr; }.github-flow { grid-template-columns:1fr; }.github-flow button { min-height:48px; }.github-history>div>div { align-items:flex-start; flex-direction:column; gap:3px; }.threshold-source-picker { grid-template-columns:1fr 1fr; }.threshold-source-label { grid-column:1/-1; }.threshold-source-picker>output { grid-column:1/-1; justify-content:flex-start; text-align:left; }.threshold-stage { min-height:250px; }.threshold-summary { grid-template-columns:1fr; }.threshold-gauge { padding-inline:10px; }.threshold-gauge-scale { grid-template-columns:minmax(0,1fr); gap:0; }.threshold-gauge-scale>span { display:none; }
+  .project-switcher { min-width:145px; }.diff-layout,.version-layout { grid-template-columns:1fr; grid-template-rows:180px minmax(0,1fr); }.diff-dialog,.version-dialog { width:calc(100vw - 12px); height:calc(100dvh - 12px); }.code-panel.editor-fullscreen { inset:4px; }.github-history>div>button { align-items:flex-start; flex-direction:column; gap:3px; }
 }

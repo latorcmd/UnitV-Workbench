@@ -568,12 +568,19 @@ self.onmessage = async event => {
     const runtime = await ensurePython();
     self.bridge = buildBridge(); runtime.globals.set('bridge', self.bridge);
     await runtime.runPythonAsync(PYTHON_BOOTSTRAP);
+    const workspace = `/unitv-project-${crypto.randomUUID()}`;
+    runtime.FS.mkdirTree(workspace);
     for (const file of payload.files || []) {
-      if (!/^[A-Za-z0-9_.-]+\.py$/.test(file.name)) continue;
-      runtime.FS.writeFile(`/${file.name}`, String(file.code || ''), { encoding: 'utf8' });
-      const moduleName = file.name.replace(/\.py$/, '');
+      const path = String(file.name || '').replace(/\\/g, '/').replace(/^\/+/, '');
+      if (!path.endsWith('.py') || path.split('/').some(part => !part || part === '.' || part === '..')) continue;
+      const directory = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+      if (directory) runtime.FS.mkdirTree(`${workspace}/${directory}`);
+      runtime.FS.writeFile(`${workspace}/${path}`, String(file.code || ''), { encoding: 'utf8' });
+      const moduleName = path.replace(/\.py$/, '').replace(/\//g, '.').replace(/\.__init__$/, '');
       await runtime.runPythonAsync(`import sys\nsys.modules.pop(${JSON.stringify(moduleName)}, None)`);
     }
+    const entryDirectory = String(payload.filename || '').replace(/\\/g, '/').includes('/') ? String(payload.filename).replace(/\\/g, '/').slice(0, String(payload.filename).replace(/\\/g, '/').lastIndexOf('/')) : '';
+    await runtime.runPythonAsync(`import os, sys, importlib\nos.chdir(${JSON.stringify(workspace)})\nsys.path.insert(0, ${JSON.stringify(workspace)})\nsys.path.insert(0, ${JSON.stringify(`${workspace}/${entryDirectory}`)})\nimportlib.invalidate_caches()`);
     post('status', { phase: 'executing', text: liveCameraMode ? 'カメラフレームを連続処理しています' : 'コードを実行しています', liveCamera:liveCameraMode });
     const { prepared, limited } = prepareCode(payload.code, liveCameraMode);
     if (limited) post('log',{level:'system',text:'固定画像モードのため while(True) を1フレームだけ実行します。',time:stamp()});

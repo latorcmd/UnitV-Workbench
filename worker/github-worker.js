@@ -262,15 +262,19 @@ function isAllowedGithubRequest(method, target) {
   }
   if (url.origin !== GITHUB_API) return false;
   const segments = url.pathname.split('/').filter(Boolean);
-  if (segments.length < 5 || segments[0] !== 'repos') return false;
+  if (segments.length < 4 || segments[0] !== 'repos') return false;
   const resource = segments.slice(3).join('/');
   if (!/^[A-Za-z0-9_.-]+$/.test(segments[1]) || !/^[A-Za-z0-9_.-]+$/.test(segments[2])) return false;
 
   if (method === 'GET') {
-    if (resource === 'commits') return [...url.searchParams.keys()].every(key => ['sha', 'path', 'per_page'].includes(key));
+    if (resource === 'commits') return [...url.searchParams.keys()].every(key => ['sha', 'path', 'per_page', 'page'].includes(key));
+    if (resource === 'branches') return [...url.searchParams.keys()].every(key => ['per_page', 'page'].includes(key));
+    if (resource.startsWith('zipball/') && resource.length > 'zipball/'.length) return !url.search;
     if (resource.startsWith('contents/')) return [...url.searchParams.keys()].every(key => key === 'ref');
     if (resource.startsWith('git/ref/heads/')) return !url.search;
     if (/^git\/commits\/[0-9a-f]{40}$/i.test(resource)) return !url.search;
+    if (/^git\/blobs\/[0-9a-f]{40}$/i.test(resource)) return !url.search;
+    if (/^git\/trees\/[0-9a-f]{40}$/i.test(resource)) return [...url.searchParams.keys()].every(key => key === 'recursive');
     return false;
   }
   if (method === 'POST') return ['git/blobs', 'git/trees', 'git/commits'].includes(resource) && !url.search;
@@ -345,7 +349,7 @@ async function handleApi(request, env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
       if (url.pathname.startsWith('/api/github/')) return await handleApi(request, env);
