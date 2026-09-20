@@ -59,7 +59,7 @@ document.querySelector('#app').innerHTML = `
       <div class="control-divider"></div>
       <div class="execution-target">
         <label><span>実行先</span><select id="execution-target"><option value="simulator">ブラウザ</option><option value="unitv">実機 UnitV</option></select></label>
-        <button class="sample-image-button" id="unitv-connect" type="button">実機接続</button>
+        <div class="execution-target-buttons"><button class="sample-image-button" id="unitv-connect" type="button">実機接続</button><button class="sample-image-button flash-button" id="unitv-flash" type="button" disabled>実機へ書込</button></div>
         <small id="unitv-connection">未接続</small>
       </div>
       <div class="run-copy"><span class="step">02</span><span><strong>コードを実行</strong><small id="execution-limit-note">静止画像は実行上限 8秒</small></span></div>
@@ -149,6 +149,17 @@ document.querySelector('#app').innerHTML = `
     <form method="dialog"><div class="dialog-head"><div><span class="panel-kicker">PROJECT FILE</span><h2>プロジェクトを保存</h2></div><button value="close" aria-label="閉じる">×</button></div>
       <label class="check-row"><input id="embed-image" type="checkbox" checked><span><strong>画像・バイナリを含める</strong><small>JPGやkmodelも含め、別の端末で同じ状態から再開できます</small></span></label>
       <div class="dialog-actions"><button value="close" class="ghost-button">キャンセル</button><button type="button" class="run-button" id="confirm-save">ダウンロード</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="flash-dialog" class="dialog small-dialog flash-dialog">
+    <form method="dialog">
+      <div class="dialog-head"><div><span class="panel-kicker amber">UNITV FLASH</span><h2>実機へプログラムを書き込む</h2></div><button value="close" aria-label="閉じる">×</button></div>
+      <p class="dialog-intro">選択中のPythonをUnitVの <code>/flash/main.py</code> へ保存します。既存のmain.pyは上書きされます。</p>
+      <div class="flash-summary"><span>書き込むファイル</span><strong id="flash-source-name">main.py</strong><small id="flash-source-size">0 byte</small></div>
+      <label class="check-row"><input id="flash-reboot" type="checkbox" checked><span><strong>書き込み後に再起動</strong><small>USB接続を切り、保存したmain.pyを自動実行します</small></span></label>
+      <p class="flash-warning">プロジェクト内の他のPython、画像、kmodelは転送しません。必要なファイルはあらかじめUnitVへ用意してください。</p>
+      <div class="dialog-actions"><button value="close" class="ghost-button" id="flash-cancel">キャンセル</button><button type="button" class="run-button" id="flash-confirm">上書きして書き込む</button></div>
     </form>
   </dialog>
 
@@ -265,7 +276,7 @@ const refs = {
   editor: $('#code-editor'), imageFile: $('#image-file'), canvas: $('#output-canvas'), empty: $('#empty-frame'), camera: $('#camera-preview'),
   imageLabel: $('#image-label'), imageDetail: $('#image-detail'), frameMeta: $('#frame-meta'), terminal: $('#terminal'),
   run: $('#run'), stop: $('#stop'), runtime: $('#runtime-state'), uart: $('#uart-input'), uartFormat: $('#uart-format'),
-  executionTarget: $('#execution-target'), unitvConnect: $('#unitv-connect'), unitvConnection: $('#unitv-connection')
+  executionTarget: $('#execution-target'), unitvConnect: $('#unitv-connect'), unitvFlash:$('#unitv-flash'), unitvConnection: $('#unitv-connection')
 };
 
 let sourceImage = null;
@@ -435,6 +446,7 @@ function setRunning(value) {
   refs.run.innerHTML = value ? '<span class="spinner"></span> 実行中' : '<span>▶</span> 実行';
   refs.executionTarget.disabled = value;
   refs.unitvConnect.disabled = value || realConnectionBusy || !serialTransport.supported;
+  refs.unitvFlash.disabled = value || realConnectionBusy || !serialTransport.connected || !isPythonEntry(activeEntry());
 }
 
 function downloadBlob(blob, name) {
@@ -451,6 +463,7 @@ function renderExecutionTarget() {
   $('#serial-baud').textContent = real ? (realUnitV.ideReady ? '実機 · 1500000 baud' : '実機 · 115200 baud') : '仮想UART · 115200 baud';
   $('#execution-limit-note').textContent = real ? '実機では停止まで連続実行' : cameraStream ? 'カメラ時は停止まで連続実行' : '静止画像は実行上限 8秒';
   refs.unitvConnect.hidden = !real;
+  refs.unitvFlash.hidden = !real;
   refs.unitvConnection.hidden = !real;
   refs.run.title = real ? '選択中のPythonを実機UnitVで実行' : '選択中のPythonをブラウザ内で実行';
   refs.empty.querySelector('strong').textContent = real ? 'UnitVのフレームを待っています' : '画像を選んでください';
@@ -472,6 +485,7 @@ function renderUnitVConnection(message = '') {
   const connected = serialTransport.connected;
   refs.unitvConnect.textContent = connected ? '切断' : '実機接続';
   refs.unitvConnect.disabled = running || realConnectionBusy || !serialTransport.supported;
+  refs.unitvFlash.disabled = running || realConnectionBusy || !connected || !isPythonEntry(activeEntry());
   refs.unitvConnection.textContent = message || (connected ? (realUnitV.ideReady ? 'IDEモード接続中' : 'USB接続中') : serialTransport.supported ? '未接続' : 'Chrome / Edgeのみ対応');
   refs.unitvConnection.classList.toggle('connected', connected);
   if (executionTarget === 'unitv') $('#serial-baud').textContent = realUnitV.ideReady ? '実機 · 1500000 baud' : '実機 · 115200 baud';
@@ -652,6 +666,7 @@ async function selectFile(id) {
   renderFileList();
   $('#save-status').textContent = '✓ この端末に保存済み';
   refs.run.disabled = running || !isPythonEntry(file);
+  renderUnitVConnection();
   await previousSave;
 }
 
@@ -1165,6 +1180,62 @@ async function disconnectUnitV({ unexpected = false } = {}) {
   } else {
     setRuntime('UnitV切断', '実機をリセットして安全に切断しました');
     addLog('system', 'UnitVの実行を停止・リセットして切断しました。');
+  }
+}
+
+function openFlashDialog() {
+  const file = activeEntry();
+  if (!serialTransport.connected) { finishWithError('先にUnitVへ接続してください。'); return; }
+  if (!isPythonEntry(file)) { finishWithError('実機へ書き込むPythonファイルを選択してください。'); return; }
+  const bytes = new TextEncoder().encode(getCode()).byteLength;
+  if (bytes > 512 * 1024) { finishWithError('実機へ書き込めるPythonは512 KB以下です。'); return; }
+  $('#flash-source-name').textContent = file.path;
+  $('#flash-source-size').textContent = `${bytes.toLocaleString('ja-JP')} byte → /flash/main.py`;
+  $('#flash-confirm').textContent = $('#flash-reboot').checked ? '上書きして再起動' : '上書きして書き込む';
+  $('#flash-dialog').showModal();
+}
+
+async function flashActiveProgram() {
+  const file = activeEntry();
+  if (!serialTransport.connected || !isPythonEntry(file) || realConnectionBusy) return;
+  const codeBytes = new TextEncoder().encode(getCode());
+  if (codeBytes.byteLength > 512 * 1024) { finishWithError('実機へ書き込めるPythonは512 KB以下です。'); return; }
+  const reboot = $('#flash-reboot').checked;
+  realConnectionBusy = true;
+  $('#flash-confirm').disabled = true; $('#flash-cancel').disabled = true;
+  refs.run.disabled = true; refs.stop.disabled = true; refs.executionTarget.disabled = true;
+  renderUnitVConnection('書き込み準備中…');
+  try {
+    await persistCurrentFile();
+    setRuntime('書き込み準備中', 'UnitVをMaixPy IDEモードへ切り替えています', 'busy');
+    addLog('system', `${file.path} を /flash/main.py へ書き込みます。`);
+    await realUnitV.activateIde(); renderUnitVConnection('IDEモード接続中');
+    await realUnitV.stop(); await sleep(160);
+    const saved = await realUnitV.saveFile('/flash/main.py', codeBytes, {
+      onProgress: ratio => {
+        const percent = Math.round(ratio * 100);
+        setRuntime('実機へ書き込み中', `${percent}% · USBケーブルを抜かないでください`, 'busy');
+        renderUnitVConnection(`書き込み中 ${percent}%`);
+      }
+    });
+    addLog('system', `/flash/main.py へ ${saved.bytes.toLocaleString('ja-JP')} byteを書き込み、SHA-256検証に成功しました。`);
+    $('#flash-dialog').close();
+    if (reboot) {
+      setRuntime('再起動中', '保存したmain.pyを起動します', 'busy');
+      await realUnitV.resetAndClose();
+      renderUnitVConnection('未接続');
+      setRuntime('書き込み完了', 'UnitVを再起動し、main.pyを自動実行しました', 'success');
+      addLog('system', 'UnitVを再起動しました。書き込んだmain.pyは本体上で動作します。');
+    } else {
+      renderUnitVConnection('IDEモード接続中');
+      setRuntime('書き込み完了', '/flash/main.pyへ保存しました', 'success');
+    }
+  } catch (error) {
+    finishWithError(`実機への書き込みに失敗しました: ${error.message}`);
+  } finally {
+    realConnectionBusy = false;
+    $('#flash-confirm').disabled = false; $('#flash-cancel').disabled = false;
+    setRunning(false); renderUnitVConnection();
   }
 }
 
@@ -1834,6 +1905,9 @@ refs.executionTarget.addEventListener('change', () => {
   setRuntime(executionTarget === 'unitv' ? '実機モード' : 'ブラウザモード', executionTarget === 'unitv' ? 'USB接続したUnitVでPythonを実行します' : '画像を選択して疑似UnitV環境で実行します');
 });
 refs.unitvConnect.addEventListener('click', () => void connectUnitV());
+refs.unitvFlash.addEventListener('click', openFlashDialog);
+$('#flash-confirm').addEventListener('click', () => void flashActiveProgram());
+$('#flash-reboot').addEventListener('change', () => { $('#flash-confirm').textContent = $('#flash-reboot').checked ? '上書きして再起動' : '上書きして書き込む'; });
 serialTransport.onDisconnect = () => { if (!realConnectionBusy) void disconnectUnitV({ unexpected:true }); };
 refs.run.addEventListener('click', runCode); refs.stop.addEventListener('click', () => void stopExecution());
 $('#clear-log').addEventListener('click', () => { refs.terminal.innerHTML=''; addLog('system','ログを消去しました。'); });

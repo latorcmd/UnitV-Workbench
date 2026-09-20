@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { commandHeader, MaixPyIdeClient, MAIXPY_COMMAND } from '../src/maixpy-ide.js';
+import { buildFileSavePayload, commandHeader, MaixPyIdeClient, MAIXPY_COMMAND } from '../src/maixpy-ide.js';
 
 function le32(value) {
   const bytes = new Uint8Array(4);
@@ -53,4 +53,29 @@ test('framebuffer enable packet includes the trailing int16 flag', async () => {
   client.ideReady = true;
   await client.setFrameBufferEnabled(true);
   assert.deepEqual([...transport.writes[0]], [0x30, MAIXPY_COMMAND.FB_ENABLE, 0, 0, 0, 0, 1, 0]);
+});
+
+test('file-save payload contains digest, aligned filename and program bytes', async () => {
+  const content = new TextEncoder().encode('print(1)\n');
+  const payload = await buildFileSavePayload('/flash/main.py', content);
+  const body = payload.subarray(32);
+  const filename = new TextDecoder().decode(body.subarray(0, 14));
+  assert.equal(filename, '/flash/main.py');
+  assert.deepEqual([...body.subarray(14, 16)], [0, 0]);
+  assert.equal(new TextDecoder().decode(body.subarray(16)), 'print(1)\n');
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', body));
+  assert.deepEqual([...payload.subarray(0, 32)], [...digest]);
+});
+
+test('saveFile waits for UnitV flash verification status', async () => {
+  const transport = new MockTransport([le32(0), le32(5), le32(0)]);
+  const client = new MaixPyIdeClient(transport);
+  client.ideReady = true;
+  const progress = [];
+  const result = await client.saveFile('/flash/main.py', new TextEncoder().encode('x=1\n'), { onProgress:value => progress.push(value) });
+  assert.deepEqual(result, { path:'/flash/main.py', bytes:4 });
+  assert.equal(progress.at(-1), 1);
+  assert.deepEqual(transport.writes.filter(packet => packet.byteLength === 6 && packet[0] === 0x30).map(packet => packet[1]), [
+    MAIXPY_COMMAND.FILE_SAVE_STATUS, MAIXPY_COMMAND.FILE_SAVE, MAIXPY_COMMAND.FILE_SAVE_STATUS, MAIXPY_COMMAND.FILE_SAVE_STATUS
+  ]);
 });
