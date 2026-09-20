@@ -453,6 +453,8 @@ function renderExecutionTarget() {
   refs.unitvConnect.hidden = !real;
   refs.unitvConnection.hidden = !real;
   refs.run.title = real ? '選択中のPythonを実機UnitVで実行' : '選択中のPythonをブラウザ内で実行';
+  refs.empty.querySelector('strong').textContent = real ? 'UnitVのフレームを待っています' : '画像を選んでください';
+  refs.empty.querySelector('small').textContent = real ? '実行すると実機のフレームバッファを表示します' : 'アップロード画像が仮想カメラになります';
   if (real) {
     refs.imageLabel.textContent = sourceImageName || '実機カメラを使用';
     refs.imageDetail.textContent = '画像入力はUnitVのsensor.snapshot()から取得';
@@ -462,6 +464,7 @@ function renderExecutionTarget() {
   } else {
     refs.imageLabel.textContent = '入力画像'; refs.imageDetail.textContent = 'PNG / JPG / WebP・最大15 MB';
   }
+  if (!running && real) setRuntime('実機モード', serialTransport.connected ? '選択中のPythonをUnitVで実行できます' : '「実機接続」からUnitVを選択してください');
   renderUnitVConnection();
 }
 
