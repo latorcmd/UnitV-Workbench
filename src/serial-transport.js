@@ -2,6 +2,14 @@ function delay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
+function serialOpenError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/failed to open serial port/i.test(message) || error?.name === 'NetworkError') {
+    return new Error('シリアルポートを開けませんでした。COM1を使っているシリアルモニタやMaixPy IDEを閉じ、UnitVをリセットしてから再接続してください。', { cause:error });
+  }
+  return error instanceof Error ? error : new Error(message);
+}
+
 export class WebSerialTransport {
   constructor(serial = globalThis.navigator?.serial) {
     this.serial = serial;
@@ -28,20 +36,42 @@ export class WebSerialTransport {
 
   async requestAndOpen(baudRate = 115200) {
     if (!this.supported) throw new Error('Web Serialに対応したChromeまたはEdgeで開いてください。');
-    this.port = await this.serial.requestPort();
+    const authorized = typeof this.serial.getPorts === 'function' ? await this.serial.getPorts() : [];
+    // Reuse a previously granted device when it is unambiguous. Besides being
+    // quicker, this lets reconnects work without displaying the native chooser
+    // again after an IDE-mode operation.
+    this.port = authorized.length === 1 ? authorized[0] : await this.serial.requestPort();
     await this.open(baudRate);
     return this.port;
   }
 
   async open(baudRate) {
     if (!this.port) throw new Error('シリアルポートが選択されていません。');
-    await this.port.open({ baudRate, dataBits:8, stopBits:1, parity:'none', flowControl:'none', bufferSize:64 * 1024 });
-    this.baudRate = baudRate;
-    this.closing = false;
-    this.readError = null;
-    this.reader = this.port.readable.getReader();
-    this.writer = this.port.writable.getWriter();
-    this.readTask = this.#readLoop();
+    let opened = false;
+    let reader = null;
+    let writer = null;
+    try {
+      await this.port.open({ baudRate, dataBits:8, stopBits:1, parity:'none', flowControl:'none', bufferSize:64 * 1024 });
+      opened = true;
+      if (!this.port.readable || !this.port.writable) throw new Error('シリアルポートの読み書きストリームを開始できませんでした。');
+      reader = this.port.readable.getReader();
+      writer = this.port.writable.getWriter();
+      this.baudRate = baudRate;
+      this.closing = false;
+      this.readError = null;
+      this.reader = reader;
+      this.writer = writer;
+      this.readTask = this.#readLoop();
+    } catch (error) {
+      try { reader?.releaseLock(); } catch { /* best effort */ }
+      try { writer?.releaseLock(); } catch { /* best effort */ }
+      if (opened) try { await this.port.close(); } catch { /* best effort */ }
+      this.reader = null;
+      this.writer = null;
+      this.readTask = null;
+      this.baudRate = 0;
+      throw serialOpenError(error);
+    }
   }
 
   async #readLoop() {

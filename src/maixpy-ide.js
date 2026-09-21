@@ -13,8 +13,13 @@ export const MAIXPY_COMMAND = Object.freeze({
   TX_BUF:0x8f
 });
 
-export const MAIXPY_IDE_BAUD = 1_500_000;
 export const MAIXPY_CONSOLE_BAUD = 115_200;
+// Keep the USB serial port open while switching from REPL to IDE mode. Closing
+// COM ports only to reopen them at 1.5 Mbaud is unreliable in Chrome on
+// Windows (and some USB-UART bridges reject that rate entirely). The MaixPy
+// IDE protocol itself is baud-rate independent, so the console rate is slower
+// but substantially more reliable for browser use.
+export const MAIXPY_IDE_BAUD = MAIXPY_CONSOLE_BAUD;
 export const MAIXPY_STATUS_MAGIC = 0xffeebbaa;
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -86,14 +91,14 @@ export class MaixPyIdeClient {
       await this.transport.write(new Uint8Array([0x0d, 0x01]));
       await delay(180);
       this.transport.discardBuffered();
-      const bootstrap = 'from machine import UART\nUART.repl_uart().init(1500000, 8, None, 1, read_buf_len=2048, ide=True, from_ide=False)';
+      const bootstrap = `from machine import UART\nUART.repl_uart().init(${MAIXPY_IDE_BAUD}, 8, None, 1, read_buf_len=2048, ide=True, from_ide=False)`;
       const code = new TextEncoder().encode(bootstrap);
       const payload = new Uint8Array(code.byteLength + 1);
       payload.set(code);
       payload[payload.length - 1] = 0x04;
       await this.transport.write(payload);
       await delay(450);
-      await this.transport.reopen(MAIXPY_IDE_BAUD);
+      if (this.transport.baudRate !== MAIXPY_IDE_BAUD) await this.transport.reopen(MAIXPY_IDE_BAUD);
       await delay(250);
       this.transport.discardBuffered();
       const status = await this.#query(MAIXPY_COMMAND.QUERY_STATUS, 4, 2500);

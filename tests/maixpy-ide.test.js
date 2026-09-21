@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildFileSavePayload, commandHeader, MaixPyIdeClient, MAIXPY_COMMAND } from '../src/maixpy-ide.js';
+import {
+  buildFileSavePayload, commandHeader, MaixPyIdeClient, MAIXPY_COMMAND,
+  MAIXPY_CONSOLE_BAUD, MAIXPY_IDE_BAUD, MAIXPY_STATUS_MAGIC
+} from '../src/maixpy-ide.js';
 
 function le32(value) {
   const bytes = new Uint8Array(4);
@@ -16,14 +19,34 @@ function frameInfo(width, height, length) {
 }
 
 class MockTransport {
-  constructor(responses = []) { this.responses = responses; this.writes = []; this.connected = true; this.baudRate = 1_500_000; }
+  constructor(responses = []) {
+    this.responses = responses;
+    this.writes = [];
+    this.reopens = [];
+    this.connected = true;
+    this.baudRate = MAIXPY_CONSOLE_BAUD;
+  }
   async write(bytes) { this.writes.push(new Uint8Array(bytes)); }
+  async reopen(baudRate) { this.reopens.push(baudRate); this.baudRate = baudRate; }
+  discardBuffered() {}
   async readExact(length) {
     const response = this.responses.shift();
     assert.equal(response.byteLength, length);
     return response;
   }
 }
+
+test('IDE mode stays at the open console baud rate on Windows Web Serial', async () => {
+  assert.equal(MAIXPY_IDE_BAUD, MAIXPY_CONSOLE_BAUD);
+  const transport = new MockTransport([le32(MAIXPY_STATUS_MAGIC)]);
+  const client = new MaixPyIdeClient(transport);
+  await client.activateIde();
+  assert.deepEqual(transport.reopens, []);
+  const bootstrap = new TextDecoder().decode(transport.writes[2]);
+  assert.match(bootstrap, /init\(115200,/);
+  assert.equal(bootstrap.charCodeAt(bootstrap.length - 1), 0x04);
+  assert.equal(client.ideReady, true);
+});
 
 test('command header uses MaixPy little-endian framing', () => {
   assert.deepEqual([...commandHeader(MAIXPY_COMMAND.SCRIPT_EXEC, 0x12345678)], [0x30, 0x05, 0x78, 0x56, 0x34, 0x12]);
