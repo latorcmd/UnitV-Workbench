@@ -21,7 +21,7 @@ export const MAIXPY_CONSOLE_BAUD = 115_200;
 // but substantially more reliable for browser use.
 export const MAIXPY_IDE_BAUD = MAIXPY_CONSOLE_BAUD;
 export const MAIXPY_STATUS_MAGIC = 0xffeebbaa;
-export const MAIXPY_DIAGNOSTIC_VERSION = 5;
+export const MAIXPY_DIAGNOSTIC_VERSION = 6;
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
@@ -35,6 +35,12 @@ export function commandHeader(command, length = 0) {
 
 function uint32(bytes, offset = 0) {
   return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(offset, true);
+}
+
+function statusMagicBytes() {
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, MAIXPY_STATUS_MAGIC, true);
+  return bytes;
 }
 
 function receivedPreview(bytes, limit = 160) {
@@ -103,7 +109,9 @@ export class MaixPyIdeClient {
       return new Uint8Array();
     }
     const received = [];
+    const startedAt = Date.now();
     const deadline = Date.now() + timeoutMs;
+    let nextProgressAt = startedAt + 5_000;
     let attempts = 0;
     while (Date.now() < deadline) {
       attempts += 1;
@@ -115,9 +123,31 @@ export class MaixPyIdeClient {
       const bytes = new Uint8Array(received);
       const text = new TextDecoder().decode(bytes);
       if (raw ? text.includes('raw REPL') : text.includes('>>>')) return { bytes, attempts };
+      if (!raw && Date.now() >= nextProgressAt) {
+        const seconds = Math.round((Date.now() - startedAt) / 1000);
+        this.#trace('IDE-02W', `REPL応答を待機中です（${seconds}秒、Ctrl+C ${attempts}回、${receivedPreview(bytes)}）。`);
+        nextProgressAt += 5_000;
+      }
     }
     const mode = raw ? 'raw REPL' : 'friendly REPL';
     throw new Error(`${mode}のプロンプトを確認できませんでした（${receivedPreview(new Uint8Array(received))}）。`);
+  }
+
+  async #detectActiveIde() {
+    if (typeof this.transport.readUntil !== 'function') return false;
+    const expectedStatus = statusMagicBytes();
+    this.transport.discardBuffered();
+    await this.transport.write(commandHeader(MAIXPY_COMMAND.QUERY_STATUS, 4));
+    try {
+      const received = await this.transport.readUntil(expectedStatus, 1_000, 4096);
+      this.#trace('IDE-01R', `起動済みのIDEモードを検出しました（前置き ${received.byteLength - expectedStatus.byteLength} byte）。`);
+      return true;
+    } catch (error) {
+      const message = error?.message || String(error);
+      if (!/IDE応答を確認できませんでした|タイムアウト/.test(message)) throw error;
+      this.#trace('IDE-01R', `IDEモード応答はありませんでした。REPLからの切り替えを続けます（${message}）`);
+      return false;
+    }
   }
 
   async connectConsole() {
@@ -145,10 +175,16 @@ export class MaixPyIdeClient {
           this.#trace(stage, `${MAIXPY_CONSOLE_BAUD} baudのREPLへ戻します。`);
           await this.transport.reopen(MAIXPY_CONSOLE_BAUD);
         }
+        stage = 'IDE-01';
+        this.#trace(stage, '前回の接続でIDEモードが本体に残っていないか確認します。');
+        if (await this.#detectActiveIde()) {
+          this.ideReady = true;
+          return;
+        }
         stage = 'IDE-02';
-        this.#trace(stage, '実行中スクリプトを停止し、friendly REPLプロンプトを待ちます（Ctrl+Cを再送します）。');
+        this.#trace(stage, '実行中スクリプトを停止し、friendly REPLプロンプトを待ちます（カメラ初期化中もCtrl+Cを再送します、最大30秒）。');
         this.transport.discardBuffered();
-        const friendlyReply = await this.#waitForReplPrompt({ timeoutMs:10_000 });
+        const friendlyReply = await this.#waitForReplPrompt({ timeoutMs:30_000 });
         this.#trace('IDE-02R', `friendly REPLを確認しました（${friendlyReply.attempts}回、${receivedPreview(friendlyReply.bytes)}）。`);
         stage = 'IDE-03';
         this.#trace(stage, 'raw REPLへ切り替え、プロンプトを確認します（Ctrl+A）。');
@@ -181,8 +217,7 @@ export class MaixPyIdeClient {
         await delay(250);
         stage = 'IDE-05';
         this.#trace(stage, 'IDE状態応答 0xFFEEBBAA を要求します（最大3回）。');
-        const expectedStatus = new Uint8Array(4);
-        new DataView(expectedStatus.buffer).setUint32(0, MAIXPY_STATUS_MAGIC, true);
+        const expectedStatus = statusMagicBytes();
         if (typeof this.transport.readUntil === 'function') {
           let received = null;
           let lastError = null;

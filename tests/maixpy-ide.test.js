@@ -44,6 +44,35 @@ class MockTransport {
   }
 }
 
+class ActiveIdeTransport {
+  constructor() {
+    this.connected = true;
+    this.baudRate = MAIXPY_CONSOLE_BAUD;
+    this.writes = [];
+  }
+  discardBuffered() {}
+  async write(bytes) { this.writes.push(new Uint8Array(bytes)); }
+  async readUntil(expected) {
+    const received = new Uint8Array(expected.byteLength + 2);
+    received.set([0xaa, 0x55]);
+    received.set(expected, 2);
+    return received;
+  }
+}
+
+test('reconnect detects IDE mode before sending REPL control bytes', async () => {
+  const transport = new ActiveIdeTransport();
+  const traces = [];
+  const client = new MaixPyIdeClient(transport, { onTrace:trace => traces.push(trace) });
+  await client.activateIde();
+  assert.equal(client.ideReady, true);
+  assert.deepEqual(transport.writes.map(packet => [...packet]), [
+    [...commandHeader(MAIXPY_COMMAND.QUERY_STATUS, 4)]
+  ]);
+  assert.match(traces.find(trace => trace.step === 'IDE-01R').message, /起動済みのIDEモード/);
+  assert.equal(traces.some(trace => trace.step === 'IDE-02'), false);
+});
+
 test('IDE mode stays at the open console baud rate on Windows Web Serial', async () => {
   assert.equal(MAIXPY_IDE_BAUD, MAIXPY_CONSOLE_BAUD);
   const transport = new MockTransport([le32(MAIXPY_STATUS_MAGIC)]);
@@ -60,7 +89,7 @@ test('IDE mode stays at the open console baud rate on Windows Web Serial', async
   assert.equal(transport.writes.filter(packet => packet[0] === 0x03 && packet[1] === 0x03 && packet[2] === 0x02).length, 3);
   assert.match(traces.find(trace => trace.step === 'IDE-02R').message, /3回/);
   assert.deepEqual(traces.map(trace => trace.step), [
-    'IDE-02', 'IDE-02R', 'IDE-03', 'IDE-03R', 'IDE-04', 'IDE-04R', 'IDE-05', 'IDE-06'
+    'IDE-01', 'IDE-02', 'IDE-02R', 'IDE-03', 'IDE-03R', 'IDE-04', 'IDE-04R', 'IDE-05', 'IDE-06'
   ]);
 });
 
