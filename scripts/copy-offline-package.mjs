@@ -20,6 +20,8 @@ async function collect(directory) {
 
 await collect(clientDirectory);
 files['README.md'] = new Uint8Array(await readFile(resolve(root, 'README.md')));
+files['LICENSE'] = new Uint8Array(await readFile(resolve(root, 'LICENSE')));
+files['THIRD_PARTY_NOTICES.md'] = new Uint8Array(await readFile(resolve(root, 'THIRD_PARTY_NOTICES.md')));
 files['start-local.bat'] = strToU8(`@echo off\r
 cd /d "%~dp0"\r
 where py >nul 2>nul\r

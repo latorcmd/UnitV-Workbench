@@ -21,9 +21,16 @@ export const MAIXPY_CONSOLE_BAUD = 115_200;
 // but substantially more reliable for browser use.
 export const MAIXPY_IDE_BAUD = MAIXPY_CONSOLE_BAUD;
 export const MAIXPY_STATUS_MAGIC = 0xffeebbaa;
-export const MAIXPY_DIAGNOSTIC_VERSION = 6;
+export const MAIXPY_DIAGNOSTIC_VERSION = 7;
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = new Error('UnitVの実行準備を停止しました。');
+  error.name = 'AbortError';
+  throw error;
+}
 
 export function commandHeader(command, length = 0) {
   const bytes = new Uint8Array(6);
@@ -79,11 +86,13 @@ const FILE_SAVE_ERRORS = Object.freeze({
 });
 
 export class MaixPyIdeClient {
-  constructor(transport, { onTrace = () => {} } = {}) {
+  constructor(transport, { onTrace = () => {}, replInitialTimeoutMs = 12_000, replRecoveryTimeoutMs = 30_000 } = {}) {
     this.transport = transport;
     this.queue = Promise.resolve();
     this.ideReady = false;
     this.onTrace = onTrace;
+    this.replInitialTimeoutMs = replInitialTimeoutMs;
+    this.replRecoveryTimeoutMs = replRecoveryTimeoutMs;
   }
 
   #trace(step, message, level = 'debug') {
@@ -103,9 +112,11 @@ export class MaixPyIdeClient {
     return bytes;
   }
 
-  async #waitForReplPrompt({ raw = false, timeoutMs = 8_000 } = {}) {
+  async #waitForReplPrompt({ raw = false, timeoutMs = 8_000, signal, progressStep = 'IDE-02W' } = {}) {
+    throwIfAborted(signal);
     if (typeof this.transport.takeBuffered !== 'function') {
       await delay(raw ? 300 : 600);
+      throwIfAborted(signal);
       return new Uint8Array();
     }
     const received = [];
@@ -114,10 +125,12 @@ export class MaixPyIdeClient {
     let nextProgressAt = startedAt + 5_000;
     let attempts = 0;
     while (Date.now() < deadline) {
+      throwIfAborted(signal);
       attempts += 1;
       if (raw) await this.transport.write(new Uint8Array([0x01]));
       else await this.transport.write(new Uint8Array([0x03, 0x03, 0x02]));
       await delay(raw ? 220 : 420);
+      throwIfAborted(signal);
       const chunk = this.transport.takeBuffered(4096);
       for (const byte of chunk) if (received.length < 8192) received.push(byte);
       const bytes = new Uint8Array(received);
@@ -125,7 +138,7 @@ export class MaixPyIdeClient {
       if (raw ? text.includes('raw REPL') : text.includes('>>>')) return { bytes, attempts };
       if (!raw && Date.now() >= nextProgressAt) {
         const seconds = Math.round((Date.now() - startedAt) / 1000);
-        this.#trace('IDE-02W', `REPL応答を待機中です（${seconds}秒、Ctrl+C ${attempts}回、${receivedPreview(bytes)}）。`);
+        this.#trace(progressStep, `REPL応答を待機中です（${seconds}秒、Ctrl+C ${attempts}回、${receivedPreview(bytes)}）。`);
         nextProgressAt += 5_000;
       }
     }
@@ -133,16 +146,19 @@ export class MaixPyIdeClient {
     throw new Error(`${mode}のプロンプトを確認できませんでした（${receivedPreview(new Uint8Array(received))}）。`);
   }
 
-  async #detectActiveIde() {
+  async #detectActiveIde(signal) {
+    throwIfAborted(signal);
     if (typeof this.transport.readUntil !== 'function') return false;
     const expectedStatus = statusMagicBytes();
     this.transport.discardBuffered();
     await this.transport.write(commandHeader(MAIXPY_COMMAND.QUERY_STATUS, 4));
     try {
       const received = await this.transport.readUntil(expectedStatus, 1_000, 4096);
+      throwIfAborted(signal);
       this.#trace('IDE-01R', `起動済みのIDEモードを検出しました（前置き ${received.byteLength - expectedStatus.byteLength} byte）。`);
       return true;
     } catch (error) {
+      throwIfAborted(signal);
       const message = error?.message || String(error);
       if (!/IDE応答を確認できませんでした|タイムアウト/.test(message)) throw error;
       this.#trace('IDE-01R', `IDEモード応答はありませんでした。REPLからの切り替えを続けます（${message}）`);
@@ -164,32 +180,52 @@ export class MaixPyIdeClient {
     }
   }
 
-  async activateIde() {
+  async activateIde({ signal } = {}) {
     return this.#serialized(async () => {
       let stage = 'IDE-00';
       try {
+        throwIfAborted(signal);
         if (this.ideReady) { this.#trace('IDE-00', 'IDEモードは既に準備済みです。'); return; }
         if (!this.transport.connected) throw new Error('先にUnitVを接続してください。');
         if (this.transport.baudRate !== MAIXPY_CONSOLE_BAUD) {
           stage = 'IDE-01';
           this.#trace(stage, `${MAIXPY_CONSOLE_BAUD} baudのREPLへ戻します。`);
           await this.transport.reopen(MAIXPY_CONSOLE_BAUD);
+          throwIfAborted(signal);
         }
         stage = 'IDE-01';
         this.#trace(stage, '前回の接続でIDEモードが本体に残っていないか確認します。');
-        if (await this.#detectActiveIde()) {
+        if (await this.#detectActiveIde(signal)) {
           this.ideReady = true;
           return;
         }
         stage = 'IDE-02';
-        this.#trace(stage, '実行中スクリプトを停止し、friendly REPLプロンプトを待ちます（カメラ初期化中もCtrl+Cを再送します、最大30秒）。');
+        this.#trace(stage, '実行中スクリプトを停止し、friendly REPLプロンプトを待ちます（最初の確認は12秒）。');
         this.transport.discardBuffered();
-        const friendlyReply = await this.#waitForReplPrompt({ timeoutMs:30_000 });
+        let friendlyReply;
+        try {
+          friendlyReply = await this.#waitForReplPrompt({ timeoutMs:this.replInitialTimeoutMs, signal });
+        } catch (error) {
+          if (error?.name === 'AbortError') throw error;
+          const silent = /0 byte/.test(error?.message || '');
+          stage = 'IDE-02B';
+          if (silent && typeof this.transport.reopen === 'function') {
+            this.#trace(stage, '応答が0 byteのため、USBポートを115200 baudで開き直してUnitVの復帰を試します。', 'warning');
+            await this.transport.reopen(MAIXPY_CONSOLE_BAUD);
+            throwIfAborted(signal);
+            this.#trace('IDE-02BR', 'USBポートを開き直しました。起動直後からCtrl+Cを送信します。');
+          } else {
+            this.#trace(stage, `起動ログは受信できたため、ポートを閉じずにREPL待機を続けます（${error.message}）`, 'warning');
+          }
+          stage = 'IDE-02C';
+          this.transport.discardBuffered();
+          friendlyReply = await this.#waitForReplPrompt({ timeoutMs:this.replRecoveryTimeoutMs, signal, progressStep:'IDE-02CW' });
+        }
         this.#trace('IDE-02R', `friendly REPLを確認しました（${friendlyReply.attempts}回、${receivedPreview(friendlyReply.bytes)}）。`);
         stage = 'IDE-03';
         this.#trace(stage, 'raw REPLへ切り替え、プロンプトを確認します（Ctrl+A）。');
         this.transport.discardBuffered();
-        const rawReply = await this.#waitForReplPrompt({ raw:true, timeoutMs:3_000 });
+        const rawReply = await this.#waitForReplPrompt({ raw:true, timeoutMs:3_000, signal });
         this.#trace('IDE-03R', `raw REPLを確認しました（${rawReply.attempts}回、${receivedPreview(rawReply.bytes)}）。`);
         stage = 'IDE-04';
         this.#trace(stage, `UART.repl_uart()をIDEモードへ初期化します（${MAIXPY_IDE_BAUD} baud）。`);
@@ -208,6 +244,7 @@ export class MaixPyIdeClient {
         payload[payload.length - 1] = 0x04;
         await this.transport.write(payload);
         await delay(700);
+        throwIfAborted(signal);
         const bootstrapReply = this.#takeBuffered('IDE-04R', 'IDE初期化コードのREPL応答');
         const bootstrapText = new TextDecoder().decode(bootstrapReply);
         if (/Traceback|(?:^|\s)(?:TypeError|ValueError|AttributeError|ImportError|SyntaxError):/m.test(bootstrapText)) {
@@ -249,6 +286,7 @@ export class MaixPyIdeClient {
         this.ideReady = true;
       } catch (error) {
         this.ideReady = false;
+        if (error?.name === 'AbortError') throw error;
         throw new Error(`${stage} で失敗: ${error.message}`, { cause:error });
       }
     });

@@ -73,6 +73,40 @@ test('reconnect detects IDE mode before sending REPL control bytes', async () =>
   assert.equal(traces.some(trace => trace.step === 'IDE-02'), false);
 });
 
+test('IDE preparation can be cancelled while waiting for the REPL', async () => {
+  const transport = new MockTransport();
+  transport.buffered = [];
+  const controller = new AbortController();
+  const client = new MaixPyIdeClient(transport);
+  const pending = client.activateIde({ signal:controller.signal });
+  setTimeout(() => controller.abort(), 20);
+  await assert.rejects(pending, error => error?.name === 'AbortError');
+  assert.equal(client.ideReady, false);
+  assert.equal(transport.writes.some(packet => new TextDecoder().decode(packet).includes('from machine import UART')), false);
+});
+
+test('silent REPL recovery reopens the same baud rate and retries', async () => {
+  const transport = new MockTransport([le32(MAIXPY_STATUS_MAGIC)]);
+  transport.buffered = [];
+  transport.recoveredReplies = [
+    new TextEncoder().encode('KeyboardInterrupt\r\n>>> '),
+    new TextEncoder().encode('raw REPL; CTRL-B to exit\r\n>'),
+    new TextEncoder().encode('OK')
+  ];
+  transport.takeBuffered = () => transport.reopens.length ? (transport.recoveredReplies.shift() || new Uint8Array()) : new Uint8Array();
+  const traces = [];
+  const client = new MaixPyIdeClient(transport, {
+    onTrace:trace => traces.push(trace),
+    replInitialTimeoutMs:1,
+    replRecoveryTimeoutMs:2_000
+  });
+  await client.activateIde();
+  assert.equal(client.ideReady, true);
+  assert.deepEqual(transport.reopens, [MAIXPY_CONSOLE_BAUD]);
+  assert.match(traces.find(trace => trace.step === 'IDE-02B').message, /0 byte/);
+  assert.match(traces.find(trace => trace.step === 'IDE-02BR').message, /開き直しました/);
+});
+
 test('IDE mode stays at the open console baud rate on Windows Web Serial', async () => {
   assert.equal(MAIXPY_IDE_BAUD, MAIXPY_CONSOLE_BAUD);
   const transport = new MockTransport([le32(MAIXPY_STATUS_MAGIC)]);

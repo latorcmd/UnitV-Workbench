@@ -46,6 +46,7 @@ document.querySelector('#app').innerHTML = `
         <button class="ghost-button" id="project-manage" type="button">管理</button>
         <button class="icon-button" id="theme-toggle" type="button" aria-label="ライトモードに切り替え" title="表示テーマ">☀</button>
         <button class="ghost-button" id="api-open" type="button">API一覧</button>
+        <button class="ghost-button" id="license-open" type="button">ライセンス</button>
         <button class="ghost-button" id="github-open" type="button">GitHub</button>
         <button class="ghost-button" id="project-open" type="button">読込</button>
         <button class="ghost-button" id="project-save" type="button">書出</button>
@@ -66,7 +67,7 @@ document.querySelector('#app').innerHTML = `
       <div class="control-divider"></div>
       <div class="execution-target">
         <label><span>実行先</span><select id="execution-target"><option value="simulator">ブラウザ</option><option value="unitv">実機 UnitV</option></select></label>
-        <div class="execution-target-buttons"><button class="sample-image-button" id="unitv-connect" type="button">実機接続</button><button class="sample-image-button flash-button" id="unitv-flash" type="button" disabled>実機へ書込</button></div>
+        <div class="execution-target-buttons"><button class="sample-image-button" id="unitv-connect" type="button">実機接続</button><button class="sample-image-button unitv-stop-button" id="unitv-stop" type="button" disabled>■ 実機停止</button><button class="sample-image-button flash-button" id="unitv-flash" type="button" disabled>実機へ書込</button></div>
         <small id="unitv-connection">未接続</small>
       </div>
       <div class="run-copy"><span class="step">02</span><span><strong>コードを実行</strong><small id="execution-limit-note">静止画像は実行上限 8秒</small></span></div>
@@ -154,6 +155,20 @@ document.querySelector('#app').innerHTML = `
         <section><h3>UART・I/O</h3><p>UART read / readline / readchar / write / any、GPIO value、ws2812 set_led / display</p></section>
         <section><h3>カメラ設定</h3><p>レジスタ読書き、auto gain / exposure / white balance、brightness / saturation / contrast、windowing</p></section>
       </div><p class="dialog-note">静止画像ではトップレベルの while(True) を1フレームだけ実行します。カメラでは各 snapshot() で新しいフレームを取得し、停止まで連続実行します。KPUは未対応です。</p>
+    </form>
+  </dialog>
+
+  <dialog id="license-dialog" class="dialog license-dialog">
+    <form method="dialog"><div class="dialog-head"><div><span class="panel-kicker">OPEN SOURCE</span><h2>ライセンス</h2></div><button value="close" aria-label="閉じる">×</button></div>
+      <p class="dialog-intro">UnitV Browser Labの自作部分はMIT Licenseで公開します。ブラウザへ同梱している主なOSSは次のとおりです。完全な一覧と表記はリポジトリの <code>LICENSE</code> と <code>THIRD_PARTY_NOTICES.md</code> にあります。</p>
+      <div class="license-list">
+        <a href="https://github.com/pyodide/pyodide" target="_blank" rel="noreferrer"><strong>Pyodide 0.28.3</strong><span>Mozilla Public License 2.0</span></a>
+        <a href="https://github.com/astral-sh/ruff" target="_blank" rel="noreferrer"><strong>Ruff WASM 0.16.1</strong><span>MIT License</span></a>
+        <a href="https://github.com/codemirror" target="_blank" rel="noreferrer"><strong>CodeMirror 6 / Lezer</strong><span>MIT License</span></a>
+        <a href="https://github.com/101arrowz/fflate" target="_blank" rel="noreferrer"><strong>fflate 0.8.3</strong><span>MIT License</span></a>
+      </div>
+      <p class="license-note">各名称・商標はそれぞれの権利者に帰属します。本アプリはM5Stack、Sipeed、GitHub、各OSSプロジェクトの公式製品ではありません。</p>
+      <div class="dialog-actions"><button value="close" class="ghost-button">閉じる</button></div>
     </form>
   </dialog>
 
@@ -289,7 +304,7 @@ const refs = {
   editor: $('#code-editor'), imageFile: $('#image-file'), canvas: $('#output-canvas'), empty: $('#empty-frame'), camera: $('#camera-preview'),
   imageLabel: $('#image-label'), imageDetail: $('#image-detail'), frameMeta: $('#frame-meta'), terminal: $('#terminal'),
   run: $('#run'), stop: $('#stop'), runtime: $('#runtime-state'), uart: $('#uart-input'), uartFormat: $('#uart-format'),
-  executionTarget: $('#execution-target'), unitvConnect: $('#unitv-connect'), unitvFlash:$('#unitv-flash'), unitvConnection: $('#unitv-connection')
+  executionTarget: $('#execution-target'), unitvConnect: $('#unitv-connect'), unitvStop:$('#unitv-stop'), unitvFlash:$('#unitv-flash'), unitvConnection: $('#unitv-connection')
 };
 
 let sourceImage = null;
@@ -350,6 +365,9 @@ let executionTarget = localStorage.getItem('unitv-execution-target') === 'unitv'
 let realPollGeneration = 0;
 let realConnectionBusy = false;
 let realStdoutBuffer = '';
+let realTracebackBuffer = '';
+let realRuntimeErrorPresented = false;
+let realExecutionAbortController = null;
 const realStdoutDecoder = new TextDecoder();
 
 const languageCompartment = new Compartment();
@@ -541,6 +559,7 @@ function setRunning(value) {
   refs.run.innerHTML = value ? '<span class="spinner"></span> 実行中' : '<span>▶</span> 実行';
   refs.executionTarget.disabled = value;
   refs.unitvConnect.disabled = value || realConnectionBusy || !serialTransport.supported;
+  refs.unitvStop.disabled = !serialTransport.connected || (!value && !realUnitV.ideReady) || realConnectionBusy;
   refs.unitvFlash.disabled = value || realConnectionBusy || !serialTransport.connected || !isPythonEntry(activeEntry());
 }
 
@@ -558,6 +577,7 @@ function renderExecutionTarget() {
   $('#serial-baud').textContent = real ? `実機 · ${serialTransport.baudRate || 115200} baud` : '仮想UART · 115200 baud';
   $('#execution-limit-note').textContent = real ? '実機では停止まで連続実行' : cameraStream ? 'カメラ時は停止まで連続実行' : '静止画像は実行上限 8秒';
   refs.unitvConnect.hidden = !real;
+  refs.unitvStop.hidden = !real;
   refs.unitvFlash.hidden = !real;
   refs.unitvConnection.hidden = !real;
   refs.run.title = real ? '選択中のPythonを実機UnitVで実行' : '選択中のPythonをブラウザ内で実行';
@@ -580,6 +600,7 @@ function renderUnitVConnection(message = '') {
   const connected = serialTransport.connected;
   refs.unitvConnect.textContent = connected ? '切断' : '実機接続';
   refs.unitvConnect.disabled = running || realConnectionBusy || !serialTransport.supported;
+  refs.unitvStop.disabled = !connected || (!running && !realUnitV.ideReady) || realConnectionBusy;
   refs.unitvFlash.disabled = running || realConnectionBusy || !connected || !isPythonEntry(activeEntry());
   refs.unitvConnection.textContent = message || (connected ? (realUnitV.ideReady ? 'IDEモード接続中' : 'USB接続中') : serialTransport.supported ? '未接続' : 'Chrome / Edgeのみ対応');
   refs.unitvConnection.classList.toggle('connected', connected);
@@ -1706,8 +1727,20 @@ function flushRealStdout(final = false) {
 
 function appendRealStdout(bytes) {
   if (!bytes?.byteLength) return;
-  realStdoutBuffer += realStdoutDecoder.decode(bytes, { stream:true });
+  const text = realStdoutDecoder.decode(bytes, { stream:true });
+  realStdoutBuffer += text;
+  realTracebackBuffer = `${realTracebackBuffer}${text}`.slice(-32_768);
   flushRealStdout(false);
+  if (!realRuntimeErrorPresented && /Traceback[\s\S]*\n\s*[A-Za-z_][\w.]*?(?:Error|Exception):/.test(realTracebackBuffer)) {
+    realRuntimeErrorPresented = true;
+    const parsed = parsePythonRuntimeError(realTracebackBuffer);
+    if (parsed.filename === '<stdin>') parsed.filename = activeEntry()?.path || parsed.filename;
+    setRuntime('実機コードエラー', `${parsed.type}: ${parsed.reason}`, 'error');
+    if (/Sensor Timeout/i.test(parsed.reason)) {
+      addLog('error', 'カメラ初期化がタイムアウトしました。実機停止後にUnitVをリセットし、カメラケーブルを確認してから再実行してください。');
+    }
+    void presentRuntimeError(parsed);
+  }
 }
 
 async function drawRealFrame(frame) {
@@ -1820,12 +1853,17 @@ async function flashActiveProgram() {
 
 async function runOnUnitV(activeFile) {
   if (!serialTransport.connected) { finishWithError('「実機接続」を押してUnitVを選択してください。'); refs.unitvConnect.focus(); return; }
-  setRunning(true); realStdoutBuffer = '';
+  setRunning(true); realStdoutBuffer = ''; realTracebackBuffer = ''; realRuntimeErrorPresented = false;
   const generation = ++realPollGeneration;
+  const abortController = new AbortController();
+  realExecutionAbortController = abortController;
   setRuntime('UnitV準備中', 'MaixPy IDEモードへ切り替えています', 'busy'); addLog('system', `実機で実行します: ${activeFile.path}`);
   try {
-    await realUnitV.activateIde(); renderUnitVConnection();
+    await realUnitV.activateIde({ signal:abortController.signal });
+    if (!running || generation !== realPollGeneration || abortController.signal.aborted) return;
+    renderUnitVConnection();
     await realUnitV.setFrameBufferEnabled(true);
+    if (!running || generation !== realPollGeneration || abortController.signal.aborted) return;
     await realUnitV.execute(getCode());
     setRuntime('実機で実行中', '停止ボタンを押すまでUnitV上で動作します', 'busy');
     while (running && generation === realPollGeneration) {
@@ -1838,7 +1876,10 @@ async function runOnUnitV(activeFile) {
     // 実機の常駐ループを誤って終了扱いにせず、停止操作で世代が変わるまで監視を続ける。
     return;
   } catch (error) {
+    if (error?.name === 'AbortError') return;
     if (generation === realPollGeneration) finishWithError(`UnitV実行エラー: ${error.message}`);
+  } finally {
+    if (realExecutionAbortController === abortController) realExecutionAbortController = null;
   }
 }
 
@@ -1846,12 +1887,29 @@ async function stopExecution(reason = '手動で実行を停止しました。')
   if (!running) return;
   clearTimeout(executionTimer); executionTimer = null;
   if (executionTarget === 'unitv') {
+    realExecutionAbortController?.abort();
     ++realPollGeneration;
     try { await realUnitV.stop(); } catch (error) { addLog('warning', `UnitVへ停止命令を送れませんでした: ${error.message}`); }
     flushRealStdout(true);
   } else { worker?.terminate(); worker = null; }
   setRunning(false);
   setRuntime('停止', '次回実行時に環境を再起動します', 'error'); addLog('warning', reason);
+}
+
+async function stopUnitVNow() {
+  if (!serialTransport.connected) return;
+  if (running) { await stopExecution('UnitVの実行を停止しました。'); return; }
+  refs.unitvStop.disabled = true;
+  try {
+    await realUnitV.stop();
+    flushRealStdout(true);
+    setRuntime('実機停止', 'UnitVへ停止命令を送信しました', 'error');
+    addLog('warning', 'UnitVへ停止命令を送信しました。');
+  } catch (error) {
+    finishWithError(`UnitVを停止できませんでした: ${error.message}`);
+  } finally {
+    renderUnitVConnection();
+  }
 }
 
 async function runCode() {
@@ -2534,6 +2592,7 @@ refs.executionTarget.addEventListener('change', () => {
   setRuntime(executionTarget === 'unitv' ? '実機モード' : 'ブラウザモード', executionTarget === 'unitv' ? 'USB接続したUnitVでPythonを実行します' : '画像を選択して疑似UnitV環境で実行します');
 });
 refs.unitvConnect.addEventListener('click', () => void connectUnitV());
+refs.unitvStop.addEventListener('click', () => void stopUnitVNow());
 refs.unitvFlash.addEventListener('click', openFlashDialog);
 $('#flash-confirm').addEventListener('click', () => void flashActiveProgram());
 $('#flash-reboot').addEventListener('change', () => { $('#flash-confirm').textContent = $('#flash-reboot').checked ? '上書きして再起動' : '上書きして書き込む'; });
@@ -2545,6 +2604,7 @@ $('#uart-queue').addEventListener('click', () => { try { uartQueued=parseUartInp
 document.querySelectorAll('[data-gpio]').forEach(button => button.addEventListener('click', () => { const pin=button.dataset.gpio; gpioState[pin]=gpioState[pin]?0:1; updateGpioUi(pin,gpioState[pin]); }));
 
 $('#api-open').addEventListener('click',()=>$('#api-dialog').showModal());
+$('#license-open').addEventListener('click',()=>$('#license-dialog').showModal());
 $('#threshold-open').addEventListener('click', openThresholdEditor);
 document.querySelectorAll('[data-threshold-source]').forEach(button => button.addEventListener('click', () => selectThresholdSource(button.dataset.thresholdSource)));
 const thresholdCanvas = $('#threshold-canvas');

@@ -5,5 +5,6 @@ public/ort/
 public/pyodide/
 work/
 outputs/
+.codex-remote-attachments/
 .sites-runtime/
 *.log
