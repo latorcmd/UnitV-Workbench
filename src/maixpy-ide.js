@@ -21,6 +21,7 @@ export const MAIXPY_CONSOLE_BAUD = 115_200;
 // but substantially more reliable for browser use.
 export const MAIXPY_IDE_BAUD = MAIXPY_CONSOLE_BAUD;
 export const MAIXPY_STATUS_MAGIC = 0xffeebbaa;
+export const MAIXPY_DIAGNOSTIC_VERSION = 2;
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
@@ -62,10 +63,15 @@ const FILE_SAVE_ERRORS = Object.freeze({
 });
 
 export class MaixPyIdeClient {
-  constructor(transport) {
+  constructor(transport, { onTrace = () => {} } = {}) {
     this.transport = transport;
     this.queue = Promise.resolve();
     this.ideReady = false;
+    this.onTrace = onTrace;
+  }
+
+  #trace(step, message, level = 'debug') {
+    this.onTrace({ step, message, level });
   }
 
   #serialized(operation) {
@@ -75,42 +81,74 @@ export class MaixPyIdeClient {
   }
 
   async connectConsole() {
-    await this.transport.requestAndOpen(MAIXPY_CONSOLE_BAUD);
-    this.ideReady = false;
+    this.#trace('SERIAL-01', `通信診断 v${MAIXPY_DIAGNOSTIC_VERSION}: 許可済みポートまたは選択ポートを ${MAIXPY_CONSOLE_BAUD} baudで開きます。`);
+    try {
+      const port = await this.transport.requestAndOpen(MAIXPY_CONSOLE_BAUD);
+      const info = port?.getInfo?.() || {};
+      const usbId = info.usbVendorId == null ? '' : ` (USB ${info.usbVendorId.toString(16).padStart(4, '0')}:${String(info.usbProductId ?? 0).toString(16).padStart(4, '0')})`;
+      this.#trace('SERIAL-02', `ポートを開きました${usbId}。`);
+      this.ideReady = false;
+    } catch (error) {
+      this.#trace('SERIAL-01', `失敗: ${error.message}`, 'error');
+      throw error;
+    }
   }
 
   async activateIde() {
     return this.#serialized(async () => {
-      if (this.ideReady) return;
-      if (!this.transport.connected) throw new Error('先にUnitVを接続してください。');
-      if (this.transport.baudRate !== MAIXPY_CONSOLE_BAUD) await this.transport.reopen(MAIXPY_CONSOLE_BAUD);
-      this.transport.discardBuffered();
-      await this.transport.write(new Uint8Array([0x0d, 0x03, 0x03]));
-      await delay(180);
-      this.transport.discardBuffered();
-      await this.transport.write(new Uint8Array([0x0d, 0x01]));
-      await delay(180);
-      this.transport.discardBuffered();
-      const bootstrap = `from machine import UART\nUART.repl_uart().init(${MAIXPY_IDE_BAUD}, 8, None, 1, read_buf_len=2048, ide=True, from_ide=False)`;
-      const code = new TextEncoder().encode(bootstrap);
-      const payload = new Uint8Array(code.byteLength + 1);
-      payload.set(code);
-      payload[payload.length - 1] = 0x04;
-      await this.transport.write(payload);
-      await delay(450);
-      if (this.transport.baudRate !== MAIXPY_IDE_BAUD) await this.transport.reopen(MAIXPY_IDE_BAUD);
-      await delay(250);
-      this.transport.discardBuffered();
-      await this.transport.write(commandHeader(MAIXPY_COMMAND.QUERY_STATUS, 4));
-      const expectedStatus = new Uint8Array(4);
-      new DataView(expectedStatus.buffer).setUint32(0, MAIXPY_STATUS_MAGIC, true);
-      if (typeof this.transport.readUntil === 'function') {
-        await this.transport.readUntil(expectedStatus, 3500, 4096);
-      } else {
-        const status = await this.transport.readExact(4, 3500);
-        if (uint32(status) !== MAIXPY_STATUS_MAGIC) throw new Error('UnitVをMaixPy IDEモードへ切り替えられませんでした。ファームウェアとUSB接続を確認してください。');
+      let stage = 'IDE-00';
+      try {
+        if (this.ideReady) { this.#trace('IDE-00', 'IDEモードは既に準備済みです。'); return; }
+        if (!this.transport.connected) throw new Error('先にUnitVを接続してください。');
+        if (this.transport.baudRate !== MAIXPY_CONSOLE_BAUD) {
+          stage = 'IDE-01';
+          this.#trace(stage, `${MAIXPY_CONSOLE_BAUD} baudのREPLへ戻します。`);
+          await this.transport.reopen(MAIXPY_CONSOLE_BAUD);
+        }
+        stage = 'IDE-02';
+        this.#trace(stage, '実行中スクリプトをCtrl+Cで停止します。');
+        this.transport.discardBuffered();
+        await this.transport.write(new Uint8Array([0x0d, 0x03, 0x03]));
+        await delay(180);
+        stage = 'IDE-03';
+        this.#trace(stage, 'raw REPLへ切り替えます（Ctrl+A）。');
+        this.transport.discardBuffered();
+        await this.transport.write(new Uint8Array([0x0d, 0x01]));
+        await delay(180);
+        stage = 'IDE-04';
+        this.#trace(stage, `UART.repl_uart()をIDEモードへ初期化します（${MAIXPY_IDE_BAUD} baud）。`);
+        this.transport.discardBuffered();
+        const bootstrap = `from machine import UART\nUART.repl_uart().init(${MAIXPY_IDE_BAUD}, 8, None, 1, read_buf_len=2048, ide=True, from_ide=False)`;
+        const code = new TextEncoder().encode(bootstrap);
+        const payload = new Uint8Array(code.byteLength + 1);
+        payload.set(code);
+        payload[payload.length - 1] = 0x04;
+        await this.transport.write(payload);
+        await delay(450);
+        if (this.transport.baudRate !== MAIXPY_IDE_BAUD) await this.transport.reopen(MAIXPY_IDE_BAUD);
+        await delay(250);
+        stage = 'IDE-05';
+        this.#trace(stage, 'REPL残留データを破棄し、IDE状態応答 0xFFEEBBAA を要求します。');
+        this.transport.discardBuffered();
+        await this.transport.write(commandHeader(MAIXPY_COMMAND.QUERY_STATUS, 4));
+        const expectedStatus = new Uint8Array(4);
+        new DataView(expectedStatus.buffer).setUint32(0, MAIXPY_STATUS_MAGIC, true);
+        if (typeof this.transport.readUntil === 'function') {
+          const received = await this.transport.readUntil(expectedStatus, 3500, 4096);
+          this.#trace('IDE-06', `IDE応答を確認しました（前置き ${received.byteLength - expectedStatus.byteLength} byte）。`);
+        } else {
+          const status = await this.transport.readExact(4, 3500);
+          if (uint32(status) !== MAIXPY_STATUS_MAGIC) {
+            const hex = [...status].map(byte => byte.toString(16).padStart(2, '0')).join(' ');
+            throw new Error(`IDE状態応答が一致しません（受信: ${hex}）。`);
+          }
+          this.#trace('IDE-06', 'IDE応答を確認しました。');
+        }
+        this.ideReady = true;
+      } catch (error) {
+        this.ideReady = false;
+        throw new Error(`${stage} で失敗: ${error.message}`, { cause:error });
       }
-      this.ideReady = true;
     });
   }
 
@@ -123,8 +161,10 @@ export class MaixPyIdeClient {
     return this.#serialized(async () => {
       if (!this.ideReady) throw new Error('UnitVがIDEモードではありません。');
       const bytes = new TextEncoder().encode(code);
+      this.#trace('RUN-01', `スクリプト ${bytes.byteLength} byteをUnitVへ送信します。`);
       await this.transport.write(commandHeader(MAIXPY_COMMAND.SCRIPT_EXEC, bytes.byteLength));
       await this.transport.write(bytes);
+      this.#trace('RUN-02', 'スクリプト実行命令を送信しました。');
     });
   }
 
@@ -149,9 +189,11 @@ export class MaixPyIdeClient {
     return this.#serialized(async () => {
       if (!this.ideReady) throw new Error('UnitVがIDEモードではありません。');
       const data = content instanceof Uint8Array ? content : new Uint8Array(content);
+      this.#trace('FLASH-01', `${path} のSHA-256付き転送データを作成します（${data.byteLength} byte）。`);
       const payload = await buildFileSavePayload(path, data);
       const initialStatus = uint32(await this.#query(MAIXPY_COMMAND.FILE_SAVE_STATUS, 4));
       if (initialStatus !== 0) throw new Error(`UnitVが別の保存処理を実行中です（状態 ${initialStatus}）。`);
+      this.#trace('FLASH-02', `UnitVへ ${payload.byteLength} byteを転送します。`);
       await this.transport.write(commandHeader(MAIXPY_COMMAND.FILE_SAVE, payload.byteLength));
       const chunkSize = 4096;
       for (let offset = 0; offset < payload.byteLength; offset += chunkSize) {
@@ -162,7 +204,10 @@ export class MaixPyIdeClient {
       while (Date.now() < deadline) {
         await delay(80);
         const status = uint32(await this.#query(MAIXPY_COMMAND.FILE_SAVE_STATUS, 4));
-        if (status === 0) return { path, bytes:data.byteLength };
+        if (status === 0) {
+          this.#trace('FLASH-03', 'UnitV側の保存とSHA-256検証が完了しました。');
+          return { path, bytes:data.byteLength };
+        }
         if (status !== 1 && status !== 5) throw new Error(FILE_SAVE_ERRORS[status] || `UnitVのファイル保存に失敗しました（状態 ${status}）。`);
       }
       throw new Error('UnitVへの書き込み完了を確認できませんでした。');

@@ -343,7 +343,9 @@ let githubBranches = [];
 let githubBranchBusy = false;
 const githubBranchLoader = new LatestBranchLoader();
 const serialTransport = new WebSerialTransport();
-const realUnitV = new MaixPyIdeClient(serialTransport);
+const realUnitV = new MaixPyIdeClient(serialTransport, {
+  onTrace:({ step, message, level }) => addLog(level || 'debug', `[${step}] ${message}`)
+});
 let executionTarget = localStorage.getItem('unitv-execution-target') === 'unitv' ? 'unitv' : 'simulator';
 let realPollGeneration = 0;
 let realConnectionBusy = false;
