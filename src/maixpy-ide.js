@@ -101,8 +101,15 @@ export class MaixPyIdeClient {
       if (this.transport.baudRate !== MAIXPY_IDE_BAUD) await this.transport.reopen(MAIXPY_IDE_BAUD);
       await delay(250);
       this.transport.discardBuffered();
-      const status = await this.#query(MAIXPY_COMMAND.QUERY_STATUS, 4, 2500);
-      if (uint32(status) !== MAIXPY_STATUS_MAGIC) throw new Error('UnitVをMaixPy IDEモードへ切り替えられませんでした。ファームウェアとUSB接続を確認してください。');
+      await this.transport.write(commandHeader(MAIXPY_COMMAND.QUERY_STATUS, 4));
+      const expectedStatus = new Uint8Array(4);
+      new DataView(expectedStatus.buffer).setUint32(0, MAIXPY_STATUS_MAGIC, true);
+      if (typeof this.transport.readUntil === 'function') {
+        await this.transport.readUntil(expectedStatus, 3500, 4096);
+      } else {
+        const status = await this.transport.readExact(4, 3500);
+        if (uint32(status) !== MAIXPY_STATUS_MAGIC) throw new Error('UnitVをMaixPy IDEモードへ切り替えられませんでした。ファームウェアとUSB接続を確認してください。');
+      }
       this.ideReady = true;
     });
   }

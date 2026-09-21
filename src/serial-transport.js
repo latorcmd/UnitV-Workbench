@@ -5,7 +5,7 @@ function delay(milliseconds) {
 function serialOpenError(error) {
   const message = error instanceof Error ? error.message : String(error);
   if (/failed to open serial port/i.test(message) || error?.name === 'NetworkError') {
-    return new Error('シリアルポートを開けませんでした。COM1を使っているシリアルモニタやMaixPy IDEを閉じ、UnitVをリセットしてから再接続してください。', { cause:error });
+    return new Error('シリアルポートを開けませんでした。選択したM5Stackポートを使っているシリアルモニタやMaixPy IDEを閉じ、UnitVをリセットしてから再接続してください。', { cause:error });
   }
   return error instanceof Error ? error : new Error(message);
 }
@@ -136,6 +136,34 @@ export class WebSerialTransport {
       else this.chunks[0] = chunk.subarray(take);
     }
     return result;
+  }
+
+  async readUntil(sequence, timeoutMs = 3000, maxBytes = 4096) {
+    const expected = sequence instanceof Uint8Array ? sequence : new Uint8Array(sequence);
+    if (!expected.byteLength) return new Uint8Array();
+    const deadline = Date.now() + timeoutMs;
+    const received = [];
+    let matched = 0;
+    while (received.length < maxBytes) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      let byte;
+      try {
+        byte = (await this.readExact(1, remaining))[0];
+      } catch (error) {
+        if (/タイムアウト/.test(error?.message || '')) break;
+        throw error;
+      }
+      received.push(byte);
+      if (byte === expected[matched]) {
+        matched += 1;
+        if (matched === expected.byteLength) return new Uint8Array(received);
+      } else {
+        matched = byte === expected[0] ? 1 : 0;
+      }
+    }
+    const preview = received.slice(0, 32).map(byte => byte.toString(16).padStart(2, '0')).join(' ');
+    throw new Error(`UnitVのIDE応答を確認できませんでした（受信 ${received.length} byte${preview ? `: ${preview}` : ''}）。`);
   }
 
   async reopen(baudRate) {
