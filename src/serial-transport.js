@@ -173,8 +173,10 @@ export class WebSerialTransport {
 
   async reopen(baudRate) {
     await this.#closeStreams();
-    await this.port.close();
-    await delay(180);
+    try { await this.port.close(); } catch { /* already closed */ }
+    // FTDI-based M5Stack interfaces need a little longer than one event loop
+    // turn before Windows releases the COM handle for a different baud rate.
+    await delay(350);
     let lastError;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {

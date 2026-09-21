@@ -11,7 +11,7 @@ import { MergeView } from '@codemirror/merge';
 import { openSearchPanel, search, searchKeymap } from '@codemirror/search';
 import { LatestBranchLoader } from './github-branch-loader.js';
 import { loadCompleteGitTree } from './github-tree.js';
-import { MaixPyIdeClient, MAIXPY_IDE_BAUD } from './maixpy-ide.js';
+import { MaixPyIdeClient } from './maixpy-ide.js';
 import { WebSerialTransport } from './serial-transport.js';
 import { ensureStorageCapacity, formatByteSize } from './storage-capacity.js';
 import { streamZipResponse } from './streaming-zip.js';
@@ -555,7 +555,7 @@ function renderExecutionTarget() {
   document.querySelector('#io-pane').classList.toggle('hardware-disabled', real);
   document.querySelectorAll('#io-pane input, #io-pane select, #io-pane button, #io-pane [data-gpio]').forEach(control => { control.disabled = real; });
   $('#device-note').textContent = real ? '実機実行中は仮想UART・GPIO・WS2812を使用しません' : 'GPIO1 / GPIO2は実機のButton A / Bに対応';
-  $('#serial-baud').textContent = real ? `実機 · ${realUnitV.ideReady ? MAIXPY_IDE_BAUD : 115200} baud` : '仮想UART · 115200 baud';
+  $('#serial-baud').textContent = real ? `実機 · ${serialTransport.baudRate || 115200} baud` : '仮想UART · 115200 baud';
   $('#execution-limit-note').textContent = real ? '実機では停止まで連続実行' : cameraStream ? 'カメラ時は停止まで連続実行' : '静止画像は実行上限 8秒';
   refs.unitvConnect.hidden = !real;
   refs.unitvFlash.hidden = !real;
@@ -583,7 +583,7 @@ function renderUnitVConnection(message = '') {
   refs.unitvFlash.disabled = running || realConnectionBusy || !connected || !isPythonEntry(activeEntry());
   refs.unitvConnection.textContent = message || (connected ? (realUnitV.ideReady ? 'IDEモード接続中' : 'USB接続中') : serialTransport.supported ? '未接続' : 'Chrome / Edgeのみ対応');
   refs.unitvConnection.classList.toggle('connected', connected);
-  if (executionTarget === 'unitv') $('#serial-baud').textContent = `実機 · ${realUnitV.ideReady ? MAIXPY_IDE_BAUD : 115200} baud`;
+  if (executionTarget === 'unitv') $('#serial-baud').textContent = `実機 · ${serialTransport.baudRate || 115200} baud`;
 }
 
 function normalizeProjectPath(value, fallback = 'untitled.py') {
@@ -1731,7 +1731,7 @@ async function connectUnitV() {
     await realUnitV.connectConsole();
     renderUnitVConnection();
     setRuntime('UnitV接続', '実行するとIDEモードへ切り替えます', 'success');
-    addLog('system', 'UnitVへUSB接続しました（115200 baud）。');
+    addLog('system', `UnitVへUSB接続しました（${serialTransport.baudRate} baud）。`);
   } catch (error) {
     try { await serialTransport.close(); } catch { /* connection never fully opened */ }
     renderUnitVConnection('接続できません');

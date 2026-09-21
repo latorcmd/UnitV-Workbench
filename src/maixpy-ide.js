@@ -20,8 +20,9 @@ export const MAIXPY_CONSOLE_BAUD = 115_200;
 // IDE protocol itself is baud-rate independent, so the console rate is slower
 // but substantially more reliable for browser use.
 export const MAIXPY_IDE_BAUD = MAIXPY_CONSOLE_BAUD;
+export const MAIXPY_BOOT_IDE_BAUD = 1_500_000;
 export const MAIXPY_STATUS_MAGIC = 0xffeebbaa;
-export const MAIXPY_DIAGNOSTIC_VERSION = 3;
+export const MAIXPY_DIAGNOSTIC_VERSION = 4;
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
@@ -97,6 +98,23 @@ export class MaixPyIdeClient {
     return bytes;
   }
 
+  async #detectBootIdeMode() {
+    this.#trace('IDE-02B', `${MAIXPY_CONSOLE_BAUD} baudで応答がないため、起動済みIDEモード（${MAIXPY_BOOT_IDE_BAUD} baud）を確認します。`);
+    await this.transport.reopen(MAIXPY_BOOT_IDE_BAUD);
+    this.transport.discardBuffered();
+    const expectedStatus = new Uint8Array(4);
+    new DataView(expectedStatus.buffer).setUint32(0, MAIXPY_STATUS_MAGIC, true);
+    await this.transport.write(commandHeader(MAIXPY_COMMAND.QUERY_STATUS, 4));
+    if (typeof this.transport.readUntil === 'function') {
+      const received = await this.transport.readUntil(expectedStatus, 1400, 4096);
+      this.#trace('IDE-02BR', `起動済みIDE応答を${MAIXPY_BOOT_IDE_BAUD} baudで確認しました（前置き ${received.byteLength - expectedStatus.byteLength} byte）。`);
+      return;
+    }
+    const status = await this.transport.readExact(4, 1400);
+    if (uint32(status) !== MAIXPY_STATUS_MAGIC) throw new Error('起動済みIDE状態応答が一致しません。');
+    this.#trace('IDE-02BR', `起動済みIDE応答を${MAIXPY_BOOT_IDE_BAUD} baudで確認しました。`);
+  }
+
   async connectConsole() {
     this.#trace('SERIAL-01', `通信診断 v${MAIXPY_DIAGNOSTIC_VERSION}: 許可済みポートまたは選択ポートを ${MAIXPY_CONSOLE_BAUD} baudで開きます。`);
     try {
@@ -127,7 +145,20 @@ export class MaixPyIdeClient {
         this.transport.discardBuffered();
         await this.transport.write(new Uint8Array([0x0d, 0x03, 0x03]));
         await delay(300);
-        this.#takeBuffered('IDE-02R', 'Ctrl+C後のREPL応答');
+        const interruptReply = this.#takeBuffered('IDE-02R', 'Ctrl+C後のREPL応答');
+        if (!interruptReply.byteLength && this.transport.baudRate === MAIXPY_CONSOLE_BAUD) {
+          try {
+            await this.#detectBootIdeMode();
+            this.ideReady = true;
+            this.#trace('IDE-06', `既に起動していたIDEモードへ${MAIXPY_BOOT_IDE_BAUD} baudで同期しました。`);
+            return;
+          } catch (error) {
+            this.#trace('IDE-02BR', `${MAIXPY_BOOT_IDE_BAUD} baudではIDE応答を確認できませんでした: ${error.message}`, 'warning');
+            stage = 'IDE-02C';
+            this.#trace(stage, `${MAIXPY_CONSOLE_BAUD} baudへ戻してREPL切替を続行します。`);
+            await this.transport.reopen(MAIXPY_CONSOLE_BAUD);
+          }
+        }
         stage = 'IDE-03';
         this.#trace(stage, 'friendly REPLを経由してraw REPLへ切り替えます（Ctrl+B → Ctrl+A）。');
         this.transport.discardBuffered();
