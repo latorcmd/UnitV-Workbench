@@ -1828,20 +1828,15 @@ async function runOnUnitV(activeFile) {
     await realUnitV.setFrameBufferEnabled(true);
     await realUnitV.execute(getCode());
     setRuntime('実機で実行中', '停止ボタンを押すまでUnitV上で動作します', 'busy');
-    let observedRunning = false;
-    let idlePolls = 0;
     while (running && generation === realPollGeneration) {
       const result = await realUnitV.poll();
       appendRealStdout(result.stdout);
       if (result.frame && generation === realPollGeneration) await drawRealFrame(result.frame);
-      if (result.running) { observedRunning = true; idlePolls = 0; }
-      else idlePolls += 1;
-      if ((observedRunning && !result.running) || (!observedRunning && idlePolls >= 3)) break;
       await sleep(70);
     }
-    if (generation !== realPollGeneration) return;
-    flushRealStdout(true); setRunning(false);
-    setRuntime('実機実行完了', 'UnitVから最終結果を取得しました', 'success'); addLog('system', 'UnitVでの実行が完了しました。');
+    // SCRIPT_RUNNINGはMaixPyファームウェアによって瞬間的にfalseを返すことがある。
+    // 実機の常駐ループを誤って終了扱いにせず、停止操作で世代が変わるまで監視を続ける。
+    return;
   } catch (error) {
     if (generation === realPollGeneration) finishWithError(`UnitV実行エラー: ${error.message}`);
   }
