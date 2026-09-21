@@ -112,18 +112,8 @@ export class WebSerialTransport {
     this.bufferedBytes = 0;
   }
 
-  async readExact(length, timeoutMs = 2000) {
-    if (!length) return new Uint8Array();
-    const deadline = Date.now() + timeoutMs;
-    while (this.bufferedBytes < length) {
-      if (this.readError) throw this.readError;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new Error(`UnitVからの応答がタイムアウトしました（${length} byte待機）。`);
-      await Promise.race([
-        new Promise(resolve => this.waiters.add(resolve)),
-        delay(remaining).then(() => { throw new Error(`UnitVからの応答がタイムアウトしました（${length} byte待機）。`); })
-      ]);
-    }
+  takeBuffered(maxBytes = this.bufferedBytes) {
+    const length = Math.max(0, Math.min(this.bufferedBytes, Number(maxBytes) || 0));
     const result = new Uint8Array(length);
     let offset = 0;
     while (offset < length) {
@@ -136,6 +126,21 @@ export class WebSerialTransport {
       else this.chunks[0] = chunk.subarray(take);
     }
     return result;
+  }
+
+  async readExact(length, timeoutMs = 2000) {
+    if (!length) return new Uint8Array();
+    const deadline = Date.now() + timeoutMs;
+    while (this.bufferedBytes < length) {
+      if (this.readError) throw this.readError;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error(`UnitVからの応答がタイムアウトしました（${length} byte待機）。`);
+      await Promise.race([
+        new Promise(resolve => this.waiters.add(resolve)),
+        delay(remaining).then(() => { throw new Error(`UnitVからの応答がタイムアウトしました（${length} byte待機）。`); })
+      ]);
+    }
+    return this.takeBuffered(length);
   }
 
   async readUntil(sequence, timeoutMs = 3000, maxBytes = 4096) {

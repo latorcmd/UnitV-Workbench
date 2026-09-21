@@ -50,6 +50,16 @@ test('finds an IDE status sequence after leftover REPL bytes', async () => {
   await transport.close();
 });
 
+test('takes currently buffered serial bytes without waiting', async () => {
+  const port = mockPort({ incoming:[[0x4f, 0x4b], [0x0d, 0x0a, 0x3e]] });
+  const transport = new WebSerialTransport({ getPorts:async () => [port], requestPort:async () => port });
+  await transport.requestAndOpen(115200);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual([...transport.takeBuffered(3)], [0x4f, 0x4b, 0x0d]);
+  assert.deepEqual([...transport.takeBuffered()], [0x0a, 0x3e]);
+  await transport.close();
+});
+
 test('turns Chrome open failures into an actionable COM-port message', async () => {
   const port = mockPort({ openError:new DOMException("Failed to open serial port.", 'NetworkError') });
   const transport = new WebSerialTransport({

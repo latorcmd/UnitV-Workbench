@@ -21,7 +21,7 @@ export const MAIXPY_CONSOLE_BAUD = 115_200;
 // but substantially more reliable for browser use.
 export const MAIXPY_IDE_BAUD = MAIXPY_CONSOLE_BAUD;
 export const MAIXPY_STATUS_MAGIC = 0xffeebbaa;
-export const MAIXPY_DIAGNOSTIC_VERSION = 2;
+export const MAIXPY_DIAGNOSTIC_VERSION = 3;
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
@@ -35,6 +35,16 @@ export function commandHeader(command, length = 0) {
 
 function uint32(bytes, offset = 0) {
   return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(offset, true);
+}
+
+function receivedPreview(bytes, limit = 160) {
+  if (!bytes?.byteLength) return '0 byte';
+  const shown = bytes.subarray(0, limit);
+  const text = new TextDecoder('utf-8', { fatal:false }).decode(shown)
+    .replace(/\\/g, '\\\\').replace(/\r/g, '\\r').replace(/\n/g, '\\n')
+    .replace(/\t/g, '\\t').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, character => `\\x${character.charCodeAt(0).toString(16).padStart(2, '0')}`);
+  const suffix = bytes.byteLength > shown.byteLength ? '…' : '';
+  return `${bytes.byteLength} byte: "${text}${suffix}"`;
 }
 
 export async function buildFileSavePayload(path, content, cryptoApi = globalThis.crypto) {
@@ -80,6 +90,13 @@ export class MaixPyIdeClient {
     return next;
   }
 
+  #takeBuffered(step, label, level = 'debug') {
+    if (typeof this.transport.takeBuffered !== 'function') return new Uint8Array();
+    const bytes = this.transport.takeBuffered(4096);
+    this.#trace(step, `${label}: ${receivedPreview(bytes)}`, level);
+    return bytes;
+  }
+
   async connectConsole() {
     this.#trace('SERIAL-01', `通信診断 v${MAIXPY_DIAGNOSTIC_VERSION}: 許可済みポートまたは選択ポートを ${MAIXPY_CONSOLE_BAUD} baudで開きます。`);
     try {
@@ -109,34 +126,70 @@ export class MaixPyIdeClient {
         this.#trace(stage, '実行中スクリプトをCtrl+Cで停止します。');
         this.transport.discardBuffered();
         await this.transport.write(new Uint8Array([0x0d, 0x03, 0x03]));
-        await delay(180);
+        await delay(300);
+        this.#takeBuffered('IDE-02R', 'Ctrl+C後のREPL応答');
         stage = 'IDE-03';
-        this.#trace(stage, 'raw REPLへ切り替えます（Ctrl+A）。');
+        this.#trace(stage, 'friendly REPLを経由してraw REPLへ切り替えます（Ctrl+B → Ctrl+A）。');
         this.transport.discardBuffered();
-        await this.transport.write(new Uint8Array([0x0d, 0x01]));
-        await delay(180);
+        await this.transport.write(new Uint8Array([0x02]));
+        await delay(100);
+        this.transport.discardBuffered();
+        await this.transport.write(new Uint8Array([0x01]));
+        await delay(300);
+        const rawReply = this.#takeBuffered('IDE-03R', 'raw REPL切替応答');
+        if (rawReply.byteLength) {
+          const rawText = new TextDecoder().decode(rawReply);
+          if (!rawText.includes('raw REPL') && !rawText.includes('>')) this.#trace('IDE-03R', 'raw REPLプロンプトを判別できませんでした。初期化コードの応答で再確認します。', 'warning');
+        }
         stage = 'IDE-04';
         this.#trace(stage, `UART.repl_uart()をIDEモードへ初期化します（${MAIXPY_IDE_BAUD} baud）。`);
         this.transport.discardBuffered();
-        const bootstrap = `from machine import UART\nUART.repl_uart().init(${MAIXPY_IDE_BAUD}, 8, None, 1, read_buf_len=2048, ide=True, from_ide=False)`;
+        const bootstrap = [
+          'from machine import UART',
+          '_repl = UART.repl_uart()',
+          'try:',
+          `    _repl.init(${MAIXPY_IDE_BAUD}, 8, None, 1, read_buf_len=2048, ide=True, from_ide=False)`,
+          'except TypeError:',
+          `    _repl.init(${MAIXPY_IDE_BAUD}, 8, None, 1, read_buf_len=2048, ide=True)`
+        ].join('\n');
         const code = new TextEncoder().encode(bootstrap);
         const payload = new Uint8Array(code.byteLength + 1);
         payload.set(code);
         payload[payload.length - 1] = 0x04;
         await this.transport.write(payload);
-        await delay(450);
+        await delay(700);
+        const bootstrapReply = this.#takeBuffered('IDE-04R', 'IDE初期化コードのREPL応答');
+        const bootstrapText = new TextDecoder().decode(bootstrapReply);
+        if (/Traceback|(?:^|\s)(?:TypeError|ValueError|AttributeError|ImportError|SyntaxError):/m.test(bootstrapText)) {
+          throw new Error(`IDE初期化コードでPython例外が発生しました（${receivedPreview(bootstrapReply)}）。`);
+        }
         if (this.transport.baudRate !== MAIXPY_IDE_BAUD) await this.transport.reopen(MAIXPY_IDE_BAUD);
         await delay(250);
         stage = 'IDE-05';
-        this.#trace(stage, 'REPL残留データを破棄し、IDE状態応答 0xFFEEBBAA を要求します。');
-        this.transport.discardBuffered();
-        await this.transport.write(commandHeader(MAIXPY_COMMAND.QUERY_STATUS, 4));
+        this.#trace(stage, 'IDE状態応答 0xFFEEBBAA を要求します（最大3回）。');
         const expectedStatus = new Uint8Array(4);
         new DataView(expectedStatus.buffer).setUint32(0, MAIXPY_STATUS_MAGIC, true);
         if (typeof this.transport.readUntil === 'function') {
-          const received = await this.transport.readUntil(expectedStatus, 3500, 4096);
+          let received = null;
+          let lastError = null;
+          for (let attempt = 1; attempt <= 3; attempt += 1) {
+            this.transport.discardBuffered();
+            this.#trace(`IDE-05.${attempt}`, `状態確認を送信します（${attempt}/3）。`);
+            await this.transport.write(commandHeader(MAIXPY_COMMAND.QUERY_STATUS, 4));
+            try {
+              received = await this.transport.readUntil(expectedStatus, 1300, 4096);
+              break;
+            } catch (error) {
+              lastError = error;
+              this.#trace(`IDE-05.${attempt}R`, error.message, attempt === 3 ? 'error' : 'warning');
+              if (attempt < 3) await delay(180);
+            }
+          }
+          if (!received) throw lastError || new Error('UnitVのIDE応答を確認できませんでした。');
           this.#trace('IDE-06', `IDE応答を確認しました（前置き ${received.byteLength - expectedStatus.byteLength} byte）。`);
         } else {
+          this.transport.discardBuffered();
+          await this.transport.write(commandHeader(MAIXPY_COMMAND.QUERY_STATUS, 4));
           const status = await this.transport.readExact(4, 3500);
           if (uint32(status) !== MAIXPY_STATUS_MAGIC) {
             const hex = [...status].map(byte => byte.toString(16).padStart(2, '0')).join(' ');
