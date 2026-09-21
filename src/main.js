@@ -5,7 +5,7 @@ import { HighlightStyle, bracketMatching, ensureSyntaxTree, foldGutter, indentUn
 import { python } from '@codemirror/lang-python';
 import { lintGutter, linter } from '@codemirror/lint';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
-import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
+import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap, startCompletion } from '@codemirror/autocomplete';
 import { tags } from '@lezer/highlight';
 import { MergeView } from '@codemirror/merge';
 import { LatestBranchLoader } from './github-branch-loader.js';
@@ -14,9 +14,13 @@ import { MaixPyIdeClient } from './maixpy-ide.js';
 import { WebSerialTransport } from './serial-transport.js';
 import { ensureStorageCapacity, formatByteSize } from './storage-capacity.js';
 import { streamZipResponse } from './streaming-zip.js';
+import { basename, flattenProjectTree, joinPath, nextAvailablePath, parentPath, planEntryMove, remapExpandedFolders } from './project-tree.js';
+import { collectPythonCompletions } from './python-completions.js';
+import { gitDiffExtension, setGitBaseline } from './editor-git-diff.js';
+import { createEntriesZip } from './zip-download.js';
 import {
   createEntry, createProject, deleteProject, listProjectEntries, listProjects,
-  removeEntry, replaceProjectEntries, saveEntries, saveEntry, saveProjectRecord
+  removeEntries, removeEntry, replaceProjectEntries, saveEntries, saveEntry, saveProjectRecord
 } from './file-store.js';
 
 const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
@@ -81,8 +85,11 @@ document.querySelector('#app').innerHTML = `
         <div class="editor-workspace">
           <aside class="file-sidebar" aria-label="プロジェクトファイル">
             <div class="file-sidebar-head"><span>FILES</span><div><button id="new-folder" type="button" title="新規フォルダ">▣</button><button id="new-file" type="button" title="新規ファイル">＋</button></div></div>
-            <div id="file-list" class="file-list"></div>
-            <small>この端末に自動保存</small>
+            <div id="file-list" class="file-list" tabindex="0" aria-label="ファイル一覧。右クリックで操作メニュー"></div>
+            <div id="file-import-status" class="file-import-status" hidden><span></span><button type="button">中止</button></div>
+            <input id="file-upload" class="visually-hidden" type="file" multiple>
+            <input id="folder-upload" class="visually-hidden" type="file" multiple webkitdirectory directory>
+            <small>Ctrl+Sで保存 · 右クリックで操作</small>
           </aside>
           <div class="editor-main">
             <div id="code-editor" aria-label="Pythonコードエディター"></div>
@@ -167,7 +174,7 @@ document.querySelector('#app').innerHTML = `
     <form method="dialog">
       <div class="dialog-head"><div><span class="panel-kicker">PROJECT ENTRY</span><h2 id="file-dialog-title">ファイルを作成</h2></div><button value="close" aria-label="閉じる">×</button></div>
       <label class="dialog-field"><span>プロジェクト内のパス</span><input id="file-name-input" autocomplete="off" value="untitled.py"></label>
-      <p class="dialog-intro">フォルダは <code>src/main.py</code> のようにパスへ含められます。内容はこの端末へ自動保存されます。</p>
+      <p class="dialog-intro">フォルダは <code>src/main.py</code> のようにパスへ含められます。コード本文はCtrl+Sで保存します。</p>
       <div class="dialog-actions file-dialog-actions"><button type="button" class="danger-button" id="file-delete" hidden>削除</button><button type="button" class="ghost-button" id="file-duplicate" hidden>複製</button><button value="close" class="ghost-button">キャンセル</button><button type="button" class="run-button" id="file-confirm">作成</button></div>
     </form>
   </dialog>
@@ -269,6 +276,7 @@ document.querySelector('#app').innerHTML = `
       <section class="github-history"><h3>最近のコミット</h3><div id="github-history">接続すると履歴を表示します。</div></section>
     </form>
   </dialog>
+  <div id="file-context-menu" class="file-context-menu" role="menu" hidden></div>
 `;
 
 const $ = selector => document.querySelector(selector);
@@ -299,8 +307,8 @@ let projects = [];
 let currentProject = null;
 let files = [];
 let currentFileId = null;
-let autosaveTimer = null;
-let suppressAutosave = false;
+const draftBuffers = new Map();
+let suppressDraftTracking = false;
 let fileDialogTarget = null;
 let fileDialogMode = 'file';
 let fileDeleteArmed = false;
@@ -308,6 +316,10 @@ let projectDialogMode = 'new';
 let projectDeleteArmed = false;
 let expandedFolders = new Set();
 let selectedChanges = new Set();
+let fileClipboard = null;
+let fileContextTarget = null;
+let draggedExplorerNode = null;
+let importCancelled = false;
 let objectUrls = new Set();
 let thresholdValues = [0, 100, -128, 127, -128, 127];
 let thresholdSelection = null;
@@ -401,12 +413,27 @@ function updateSyntaxStatus(view = editorView) {
   status.classList.toggle('has-error', Boolean(count));
 }
 
+function pythonCompletionSource(context) {
+  if (!isPythonEntry(activeEntry())) return null;
+  const word = context.matchBefore(/[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?/);
+  if (!word && !context.explicit) return null;
+  const query = word?.text.toLowerCase() || '';
+  const options = collectPythonCompletions(context.state.doc.toString())
+    .filter(option => !query || option.label.toLowerCase().startsWith(query))
+    .map(option => ({ ...option, boost:option.detail === 'Pythonキーワード' ? 100 : option.detail.includes('このファイル') || option.detail === '関数の引数' ? 60 : 0 }));
+  return { from:word?.from ?? context.pos, options, validFor:/^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?$/ };
+}
+
 function configureEditorForEntry(entry) {
   if (!editorView) return;
   const isPython = isPythonEntry(entry);
   editorView.dispatch({ effects: [
     languageCompartment.reconfigure(isPython ? python() : []),
-    lintCompartment.reconfigure(isPython ? [lintGutter(), linter(syntaxDiagnostics, { delay: 250 })] : [])
+    lintCompartment.reconfigure(isPython ? [lintGutter(), linter(syntaxDiagnostics, { delay: 250 })] : []),
+    setGitBaseline.of({
+      enabled:Boolean(entry?.kind === 'text' && currentProject?.source?.type === 'github'),
+      text:entry?.basePath ? entry.baseText || '' : ''
+    })
   ] });
   updateSyntaxStatus();
 }
@@ -515,6 +542,18 @@ function makeUniqueFilename(requested, ignoredId = null) {
 function activeEntry() { return files.find(file => file.id === currentFileId && !file.deleted) || null; }
 function visibleFiles() { return files.filter(file => !file.deleted); }
 function isPythonEntry(entry) { return Boolean(entry?.kind === 'text' && entry.path.toLowerCase().endsWith('.py')); }
+function currentEntryText(entry) { return entry?.kind === 'text' && draftBuffers.has(entry.id) ? draftBuffers.get(entry.id) : entry?.text || ''; }
+function isDirtyEntry(entry) { return Boolean(entry?.kind === 'text' && draftBuffers.has(entry.id) && draftBuffers.get(entry.id) !== (entry.text || '')); }
+function dirtyEntries() { return files.filter(entry => isDirtyEntry(entry)); }
+function hasUnsavedChanges() { return draftBuffers.size > 0; }
+
+function renderSaveStatus(message = '') {
+  const status = $('#save-status');
+  if (message) { status.textContent = message; return; }
+  const active = activeEntry(); const count = dirtyEntries().length;
+  if (active && isDirtyEntry(active)) status.textContent = count > 1 ? `● 未保存（全${count}件）` : '● 未保存';
+  else status.textContent = count ? `✓ 保存済み（ほかに未保存 ${count}件）` : '✓ この端末に保存済み';
+}
 
 function entryStatus(entry) {
   if (!currentProject?.source || currentProject.source.type !== 'github') return '';
@@ -561,41 +600,23 @@ function renderGitVersion() {
     badge.textContent = 'LOCAL'; badge.className = 'git-version'; $('#diff-open').disabled = true; return;
   }
   const sha = currentProject.source.headSha?.slice(0, 7) || '-------';
-  badge.textContent = `${currentProject.source.branch} · ${sha}${changes.length ? ` · ${changes.length}変更` : ' · clean'}`;
-  badge.className = `git-version${changes.length ? ' changed' : ''}`;
+  const unsaved = dirtyEntries().length;
+  badge.textContent = `${currentProject.source.branch} · ${sha}${changes.length ? ` · ${changes.length}変更` : ' · clean'}${unsaved ? ` · ${unsaved}未保存` : ''}`;
+  badge.className = `git-version${changes.length || unsaved ? ' changed' : ''}`;
   $('#diff-open').disabled = !changes.length;
 }
 
 function renderFileList() {
   const list = $('#file-list');
   list.replaceChildren();
-  const availableFiles = visibleFiles();
-  const folders = new Set();
-  availableFiles.forEach(file => {
-    if (file.kind === 'folder') folders.add(file.path);
-    const parts = file.path.split('/');
-    for (let index = 1; index < parts.length; index += 1) folders.add(parts.slice(0, index).join('/'));
-  });
-  const nodes = [
-    ...[...folders].map(path => ({ type: 'folder', path })),
-    ...availableFiles.filter(file => file.kind !== 'folder').map(file => ({ type: 'file', path: file.path, file }))
-  ].sort((a, b) => {
-    const aParent = a.path.includes('/') ? a.path.slice(0, a.path.lastIndexOf('/')) : '';
-    const bParent = b.path.includes('/') ? b.path.slice(0, b.path.lastIndexOf('/')) : '';
-    if (aParent === bParent && a.type !== b.type) return a.type === 'folder' ? -1 : 1;
-    return a.path.localeCompare(b.path);
-  });
   const fragment = document.createDocumentFragment();
-  nodes.forEach(node => {
-    const parents = node.path.split('/').slice(0, -1);
-    if (parents.some((_, index) => !expandedFolders.has(parents.slice(0, index + 1).join('/')))) return;
-    const depth = node.path.split('/').length - 1;
+  flattenProjectTree(visibleFiles(), expandedFolders).forEach(node => {
     const row = document.createElement('div');
     row.className = `file-row${node.file?.id === currentFileId ? ' active' : ''}${node.type === 'folder' ? ' folder' : ''}`;
-    row.style.setProperty('--tree-depth', depth);
+    row.style.setProperty('--tree-depth', node.depth); row.dataset.path = node.path; row.dataset.type = node.type; row.draggable = true;
     const open = document.createElement('button');
     open.type = 'button'; open.className = 'file-open'; open.title = node.path;
-    const label = node.path.split('/').pop();
+    const label = basename(node.path);
     if (node.type === 'folder') {
       const expanded = expandedFolders.has(node.path);
       open.innerHTML = `<span>${expanded ? '▾' : '▸'}</span><b></b>`; open.querySelector('b').textContent = label;
@@ -603,44 +624,79 @@ function renderFileList() {
     } else {
       const icon = node.file.kind === 'image' ? 'IMG' : node.file.kind === 'text' ? (node.path.toLowerCase().endsWith('.py') ? 'PY' : 'TXT') : 'BIN';
       open.innerHTML = '<span></span><b></b><i></i>'; open.querySelector('span').textContent = icon; open.querySelector('b').textContent = label;
-      const status = entryStatus(node.file); open.querySelector('i').textContent = status;
-      open.addEventListener('click', () => selectFile(node.file.id));
+      const dirty = isDirtyEntry(node.file); const status = entryStatus(node.file); const indicator = open.querySelector('i');
+      indicator.textContent = dirty ? '●' : status; indicator.classList.toggle('dirty', dirty); indicator.title = dirty ? '未保存' : status ? `Git: ${status}` : '';
+      open.addEventListener('click', () => void selectFile(node.file.id));
     }
     const menu = document.createElement('button');
-    menu.type = 'button'; menu.className = 'file-menu'; menu.textContent = '•••'; menu.title = '名前変更・複製・削除';
-    menu.addEventListener('click', () => node.type === 'folder' ? editFolder(node.path) : editFile(node.file.id));
+    menu.type = 'button'; menu.className = 'file-menu'; menu.textContent = '•••'; menu.title = 'ファイル操作';
+    menu.addEventListener('click', event => { const rect = event.currentTarget.getBoundingClientRect(); showFileContextMenu(rect.right, rect.bottom, node); });
+    row.addEventListener('contextmenu', event => { event.preventDefault(); showFileContextMenu(event.clientX, event.clientY, node); });
+    row.addEventListener('dragstart', event => {
+      draggedExplorerNode = node; row.classList.add('dragging');
+      event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-unitv-entry', JSON.stringify({ projectId:currentProject.id, path:node.path, type:node.type }));
+    });
+    row.addEventListener('dragend', () => { draggedExplorerNode = null; row.classList.remove('dragging'); document.querySelectorAll('.file-row.drop-target').forEach(item => item.classList.remove('drop-target')); });
+    row.addEventListener('dragover', event => { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = draggedExplorerNode ? 'move' : 'copy'; row.classList.add('drop-target'); });
+    row.addEventListener('dragleave', () => row.classList.remove('drop-target'));
+    row.addEventListener('drop', event => { event.preventDefault(); event.stopPropagation(); row.classList.remove('drop-target'); void handleExplorerDrop(event, node); });
     row.append(open, menu); fragment.append(row);
   });
   list.append(fragment);
-  renderGitVersion();
+  renderGitVersion(); renderSaveStatus();
 }
 
-async function persistCurrentFile() {
+async function saveCurrentFile() {
   const file = activeEntry();
   if (!file || file.kind !== 'text' || !editorView) return;
-  file.text = getCode(); file.size = new Blob([file.text]).size; file.updatedAt = new Date().toISOString();
-  $('#save-status').textContent = '保存中…';
+  const nextText = getCode();
+  if (!isDirtyEntry(file) && nextText === file.text) { renderSaveStatus(); return; }
+  const previous = { text:file.text, size:file.size, updatedAt:file.updatedAt };
+  file.text = nextText; file.size = new Blob([nextText]).size; file.updatedAt = new Date().toISOString();
+  renderSaveStatus('保存中…');
   try {
     await saveEntry(file);
+    draftBuffers.delete(file.id);
     if (currentProject && currentFileId === file.id) { currentProject.activePath = file.path; await saveProjectRecord(currentProject); }
-    $('#save-status').textContent = '✓ この端末に保存済み';
     if (entryStatus(file)) selectedChanges.add(file.id); else selectedChanges.delete(file.id);
-    renderFileList();
+    renderFileList(); renderGithubState();
   } catch (error) {
-    $('#save-status').textContent = '保存に失敗';
+    file.text = previous.text; file.size = previous.size; file.updatedAt = previous.updatedAt; draftBuffers.set(file.id, nextText);
+    renderSaveStatus('保存に失敗');
     addLog('error', `ローカル保存に失敗しました: ${error.message}`);
   }
 }
 
-function scheduleAutosave() {
-  $('#save-status').textContent = '未保存の変更';
-  clearTimeout(autosaveTimer);
-  autosaveTimer = setTimeout(persistCurrentFile, 450);
+async function saveAllDirtyFiles() {
+  const dirty = dirtyEntries();
+  if (!dirty.length) { renderSaveStatus(); return; }
+  const previous = dirty.map(entry => ({ entry, text:entry.text, size:entry.size, updatedAt:entry.updatedAt }));
+  dirty.forEach(entry => { entry.text = draftBuffers.get(entry.id); entry.size = new Blob([entry.text]).size; entry.updatedAt = new Date().toISOString(); });
+  renderSaveStatus(`全${dirty.length}件を保存中…`);
+  try {
+    await saveEntries(dirty); dirty.forEach(entry => { draftBuffers.delete(entry.id); if (entryStatus(entry)) selectedChanges.add(entry.id); else selectedChanges.delete(entry.id); });
+    renderFileList(); renderGithubState(); addLog('system', `${dirty.length}件のファイルを保存しました。`);
+  } catch (error) {
+    previous.forEach(value => { value.entry.text = value.text; value.entry.size = value.size; value.entry.updatedAt = value.updatedAt; });
+    renderSaveStatus('保存に失敗'); addLog('error', `全ファイルの保存に失敗しました: ${error.message}`);
+  }
+}
+
+function trackCurrentDraft() {
+  const file = activeEntry(); if (!file || file.kind !== 'text') return;
+  const wasDirty = isDirtyEntry(file);
+  const text = getCode();
+  if (text === (file.text || '')) draftBuffers.delete(file.id); else draftBuffers.set(file.id, text);
+  const dirty = isDirtyEntry(file);
+  if (dirty !== wasDirty) {
+    const indicator = document.querySelector('.file-row.active .file-open i');
+    if (indicator) { indicator.textContent = dirty ? '●' : entryStatus(file); indicator.classList.toggle('dirty', dirty); indicator.title = dirty ? '未保存' : ''; }
+  }
+  renderSaveStatus(); renderGitVersion();
 }
 
 async function selectFile(id) {
   if (id === currentFileId || !files.some(file => file.id === id)) return;
-  clearTimeout(autosaveTimer); const previousSave = persistCurrentFile();
   currentFileId = id;
   const file = files.find(item => item.id === id);
   if (!file || file.kind === 'folder') return;
@@ -651,7 +707,7 @@ async function selectFile(id) {
   $('#binary-viewer').hidden = !['binary', 'submodule'].includes(file.kind);
   $('#binary-download').disabled = file.kind !== 'binary' || !file.blob;
   if (file.kind === 'text') {
-    suppressAutosave = true; setCode(file.text || ''); suppressAutosave = false;
+    suppressDraftTracking = true; setCode(currentEntryText(file)); suppressDraftTracking = false;
     configureEditorForEntry(file); editorView.focus();
   } else if (file.kind === 'image') {
     $('#asset-image').src = objectUrl(file.blob);
@@ -667,22 +723,20 @@ async function selectFile(id) {
   if (currentProject) { currentProject.activePath = file.path; void saveProjectRecord(currentProject); }
   localStorage.setItem('unitv-active-project', currentProject?.id || '');
   renderFileList();
-  $('#save-status').textContent = '✓ この端末に保存済み';
   refs.run.disabled = running || !isPythonEntry(file);
   renderUnitVConnection();
-  await previousSave;
 }
 
-function openNewFileDialog() {
+function openNewFileDialog(folder = '') {
   fileDialogTarget = null; fileDialogMode = 'file-new'; fileDeleteArmed = false;
-  $('#file-dialog-title').textContent = 'ファイルを作成'; $('#file-name-input').value = makeUniqueFilename('untitled.py');
+  $('#file-dialog-title').textContent = 'ファイルを作成'; $('#file-name-input').value = makeUniqueFilename(joinPath(folder, 'untitled.py'));
   $('#file-confirm').textContent = '作成'; $('#file-delete').hidden = true; $('#file-duplicate').hidden = true;
   $('#file-dialog').showModal(); $('#file-name-input').focus(); $('#file-name-input').select();
 }
 
-function openNewFolderDialog() {
+function openNewFolderDialog(folder = '') {
   fileDialogTarget = null; fileDialogMode = 'folder-new'; fileDeleteArmed = false;
-  $('#file-dialog-title').textContent = 'フォルダを作成'; $('#file-name-input').value = 'new-folder';
+  $('#file-dialog-title').textContent = 'フォルダを作成'; $('#file-name-input').value = nextAvailablePath(new Set(visibleFiles().map(file => file.path)), joinPath(folder, 'new-folder'));
   $('#file-confirm').textContent = '作成'; $('#file-delete').hidden = true; $('#file-duplicate').hidden = true;
   $('#file-dialog').showModal(); $('#file-name-input').focus(); $('#file-name-input').select();
 }
@@ -716,15 +770,22 @@ async function confirmFileDialog() {
   }
   if (fileDialogMode === 'folder-edit') {
     const oldPath = String(fileDialogTarget); const affected = files.filter(file => !file.deleted && (file.path === oldPath || file.path.startsWith(`${oldPath}/`)));
+    if (requested.startsWith(`${oldPath}/`)) { addLog('error', 'フォルダを自分自身の子フォルダへ移動できません。'); return; }
+    const affectedIds = new Set(affected.map(file => file.id)); const occupied = new Set();
+    files.filter(file => !file.deleted && !affectedIds.has(file.id)).forEach(file => { occupied.add(file.path); const parts = file.path.split('/'); for (let index = 1; index < parts.length; index += 1) occupied.add(parts.slice(0, index).join('/')); });
+    if (requested !== oldPath && occupied.has(requested)) { addLog('error', '同じ場所に同じ名前のフォルダがあります。'); return; }
     const replacements = affected.map(file => ({ file, path: `${requested}${file.path.slice(oldPath.length)}` }));
     if (replacements.some(item => files.some(other => !other.deleted && !affected.includes(other) && other.path === item.path))) { addLog('error', '同じ場所にファイルがあります。'); return; }
     replacements.forEach(item => { item.file.path = item.path; selectedChanges.add(item.file.id); }); await saveEntries(affected);
-    expandedFolders.delete(oldPath); expandedFolders.add(requested); $('#file-dialog').close(); renderFileList(); return;
+    expandedFolders = remapExpandedFolders(expandedFolders, oldPath, requested); expandedFolders.add(requested);
+    if (activeEntry()) { $('#active-file-name').textContent = activeEntry().path; currentProject.activePath = activeEntry().path; void saveProjectRecord(currentProject); }
+    $('#file-dialog').close(); renderFileList(); return;
   }
   const file = files.find(item => item.id === fileDialogTarget); if (!file) return;
-  file.path = makeUniqueFilename(requested, file.id);
+  if (requested !== file.path && occupiedProjectPaths().has(requested)) { addLog('error', '同じ場所に同じ名前のファイルまたはフォルダがあります。'); return; }
+  file.path = requested;
   selectedChanges.add(file.id); await saveEntry(file); renderFileList();
-  if (file.id === currentFileId) $('#active-file-name').textContent = file.path;
+  if (file.id === currentFileId) { $('#active-file-name').textContent = file.path; currentProject.activePath = file.path; void saveProjectRecord(currentProject); configureEditorForEntry(file); }
   $('#file-dialog').close();
 }
 
@@ -736,13 +797,20 @@ async function duplicateFileDialog() {
 }
 
 async function deleteFileDialog() {
-  if (!fileDeleteArmed) { fileDeleteArmed = true; $('#file-delete').textContent = 'もう一度押して削除'; return; }
+  if (!fileDeleteArmed) {
+    const targetIds = fileDialogMode === 'folder-edit'
+      ? files.filter(file => !file.deleted && (file.path === fileDialogTarget || file.path.startsWith(`${fileDialogTarget}/`))).map(file => file.id)
+      : [fileDialogTarget];
+    const hasDirtyTarget = targetIds.some(id => draftBuffers.has(id));
+    fileDeleteArmed = true; $('#file-delete').textContent = hasDirtyTarget ? '未保存の編集も削除する' : 'もう一度押して削除'; return;
+  }
   let targets;
   if (fileDialogMode === 'folder-edit') {
     const folder = String(fileDialogTarget); targets = files.filter(file => !file.deleted && (file.path === folder || file.path.startsWith(`${folder}/`)));
   } else targets = files.filter(file => file.id === fileDialogTarget);
   const deletingActive = targets.some(file => file.id === currentFileId);
   for (const file of targets) {
+    draftBuffers.delete(file.id);
     if (file.basePath) { file.deleted = true; selectedChanges.add(file.id); await saveEntry(file); }
     else { files = files.filter(item => item.id !== file.id); await removeEntry(file.id); }
   }
@@ -752,6 +820,217 @@ async function deleteFileDialog() {
   } else renderFileList();
 }
 
+function occupiedProjectPaths() {
+  const paths = new Set();
+  visibleFiles().forEach(entry => {
+    paths.add(entry.path);
+    const parts = entry.path.split('/');
+    for (let index = 1; index < parts.length; index += 1) paths.add(parts.slice(0, index).join('/'));
+  });
+  return paths;
+}
+
+function nodeTargetFolder(node) { return node?.type === 'folder' ? node.path : node ? parentPath(node.path) : ''; }
+
+async function moveExplorerNode(source, targetFolder) {
+  try {
+    const plan = planEntryMove(files, source.path, targetFolder);
+    if (!plan.changes.length) return;
+    plan.changes.forEach(change => { change.entry.path = change.path; selectedChanges.add(change.entry.id); });
+    await saveEntries(plan.changes.map(change => change.entry));
+    expandedFolders = remapExpandedFolders(expandedFolders, source.path, plan.destination); expandedFolders.add(targetFolder);
+    const active = activeEntry();
+    if (active) { $('#active-file-name').textContent = active.path; currentProject.activePath = active.path; void saveProjectRecord(currentProject); configureEditorForEntry(active); }
+    renderFileList(); addLog('system', `${source.path} を ${targetFolder || 'プロジェクト直下'}へ移動しました。`);
+  } catch (error) { addLog('error', error.message); }
+}
+
+function cloneEntry(entry, path) {
+  return createEntry({
+    projectId:currentProject.id, path, kind:entry.kind, text:entry.text || '', blob:entry.blob || null,
+    mime:entry.mime || '', size:entry.size, mode:entry.mode || '100644', order:files.length
+  });
+}
+
+async function copyExplorerNode(source, targetFolder) {
+  const existing = occupiedProjectPaths();
+  const requested = joinPath(targetFolder, basename(source.path));
+  const destination = nextAvailablePath(existing, requested);
+  const sourceEntries = visibleFiles().filter(entry => entry.path === source.path || entry.path.startsWith(`${source.path}/`));
+  const created = sourceEntries.map(entry => cloneEntry(entry, `${destination}${entry.path.slice(source.path.length)}`));
+  if (source.type === 'folder' && !created.some(entry => entry.path === destination)) created.unshift(createEntry({ projectId:currentProject.id, path:destination, kind:'folder', order:files.length }));
+  if (!created.length) throw new Error('コピーする項目が見つかりません。');
+  const dirty = sourceEntries.filter(isDirtyEntry);
+  if (dirty.length) addLog('warning', 'コピーには保存済みの内容を使用しました。未保存の編集は元ファイルに残っています。');
+  await saveEntries(created); files.push(...created); created.forEach(entry => selectedChanges.add(entry.id)); expandedFolders.add(targetFolder); renderFileList();
+  addLog('system', `${source.path} を ${destination} にコピーしました。`);
+}
+
+async function pasteExplorerClipboard(targetFolder) {
+  if (!fileClipboard) return;
+  if (fileClipboard.projectId !== currentProject.id) { addLog('error', '別のプロジェクトへは貼り付けできません。'); return; }
+  const source = { path:fileClipboard.path, type:fileClipboard.type };
+  if (fileClipboard.mode === 'cut') {
+    await moveExplorerNode(source, targetFolder); fileClipboard = null;
+  } else {
+    try { await copyExplorerNode(source, targetFolder); } catch (error) { addLog('error', error.message); }
+  }
+}
+
+function ensureEntriesSaved(entries, action) {
+  const dirty = entries.filter(isDirtyEntry);
+  if (!dirty.length) return true;
+  addLog('warning', `${action}の前に ${dirty.length}件の未保存ファイルをCtrl+Sで保存してください。`); renderSaveStatus('● 保存してから続行してください'); return false;
+}
+
+function assertProjectSaved(action) {
+  const dirty = dirtyEntries();
+  if (!dirty.length) return;
+  renderSaveStatus('● 保存してから続行してください');
+  throw new Error(`${action}の前に ${dirty.length}件の未保存ファイルをCtrl+SまたはCtrl+Shift+Sで保存してください。`);
+}
+
+async function downloadExplorerNode(node) {
+  const entries = node.type === 'folder'
+    ? visibleFiles().filter(entry => entry.path === node.path || entry.path.startsWith(`${node.path}/`))
+    : visibleFiles().filter(entry => entry.path === node.path);
+  if (!entries.length || !ensureEntriesSaved(entries, 'ダウンロード')) return;
+  try {
+    if (node.type === 'folder') {
+      const blob = await createEntriesZip(entries, parentPath(node.path)); downloadBlob(blob, `${basename(node.path)}.zip`);
+    } else {
+      const entry = entries[0]; const blob = entry.kind === 'text' ? new Blob([entry.text || ''], { type:'text/plain;charset=utf-8' }) : entry.blob;
+      if (!blob) throw new Error('ダウンロードできる内容がありません。'); downloadBlob(blob, basename(entry.path));
+    }
+  } catch (error) { addLog('error', `ダウンロードを準備できません: ${error.message}`); }
+}
+
+function hideFileContextMenu() { const menu = $('#file-context-menu'); menu.hidden = true; menu.replaceChildren(); fileContextTarget = null; }
+
+function showFileContextMenu(x, y, node = null) {
+  const menu = $('#file-context-menu'); menu.replaceChildren(); fileContextTarget = node;
+  const folder = nodeTargetFolder(node);
+  const addItem = (label, handler, { danger = false, disabled = false, separator = false } = {}) => {
+    if (separator) { const line = document.createElement('hr'); menu.append(line); }
+    const button = document.createElement('button'); button.type = 'button'; button.role = 'menuitem'; button.textContent = label; button.disabled = disabled;
+    if (danger) button.classList.add('danger');
+    button.addEventListener('click', () => { hideFileContextMenu(); handler(); }); menu.append(button);
+  };
+  if (!node || node.type === 'folder') {
+    const target = node?.path || '';
+    addItem('新規ファイル', () => openNewFileDialog(target));
+    addItem('新規フォルダ', () => openNewFolderDialog(target));
+    addItem('ファイルを追加…', () => openFileUpload(target), { separator:true });
+    addItem('フォルダを追加…', () => openFolderUpload(target));
+    addItem('貼り付け', () => void pasteExplorerClipboard(target), { disabled:!fileClipboard, separator:true });
+  }
+  if (node) {
+    addItem('名前を変更', () => node.type === 'folder' ? editFolder(node.path) : editFile(node.file.id), { separator:true });
+    addItem('切り取り', () => { fileClipboard = { mode:'cut', projectId:currentProject.id, path:node.path, type:node.type }; });
+    addItem('コピー', () => { fileClipboard = { mode:'copy', projectId:currentProject.id, path:node.path, type:node.type }; });
+    addItem('ダウンロード', () => void downloadExplorerNode(node));
+    addItem('削除', () => node.type === 'folder' ? editFolder(node.path) : editFile(node.file.id), { danger:true, separator:true });
+  }
+  menu.hidden = false;
+  const left = x || 8; const top = y || 8;
+  menu.style.left = `${Math.min(left, innerWidth - menu.offsetWidth - 8)}px`;
+  menu.style.top = `${Math.min(top, innerHeight - menu.offsetHeight - 8)}px`;
+  menu.querySelector('button:not(:disabled)')?.focus();
+}
+
+let pendingUploadFolder = '';
+function openFileUpload(folder = '') { pendingUploadFolder = folder; $('#file-upload').click(); }
+function openFolderUpload(folder = '') { pendingUploadFolder = folder; $('#folder-upload').click(); }
+
+function setImportStatus(message = '') {
+  const panel = $('#file-import-status'); panel.hidden = !message; panel.querySelector('span').textContent = message;
+}
+
+function readDirectoryEntries(reader) {
+  return new Promise((resolve, reject) => {
+    const result = [];
+    const read = () => reader.readEntries(entries => { if (!entries.length) resolve(result); else { result.push(...entries); read(); } }, reject);
+    read();
+  });
+}
+
+async function collectDroppedItems(dataTransfer) {
+  const fileItems = []; const folders = [];
+  const walk = async (entry, prefix = '') => {
+    if (importCancelled) return;
+    const path = joinPath(prefix, entry.name);
+    if (entry.isFile) {
+      const file = await new Promise((resolve, reject) => entry.file(resolve, reject)); fileItems.push({ file, path }); return;
+    }
+    if (entry.isDirectory) {
+      folders.push(path); const children = await readDirectoryEntries(entry.createReader());
+      for (const child of children) await walk(child, path);
+    }
+  };
+  const entries = [...(dataTransfer.items || [])].map(item => item.webkitGetAsEntry?.()).filter(Boolean);
+  if (entries.length) { for (const entry of entries) await walk(entry); return { fileItems, folders }; }
+  return { fileItems:[...(dataTransfer.files || [])].map(file => ({ file, path:file.name })), folders:[] };
+}
+
+async function browserFileToEntry(file, path) {
+  const mime = imageMime(path);
+  if (mime) {
+    if (file.size > MAX_IMAGE_BYTES) throw new Error(`${path} は画像上限の15 MBを超えています。`);
+    return createEntry({ projectId:currentProject.id, path, kind:'image', blob:file, mime:mime || file.type, size:file.size, order:files.length });
+  }
+  if (file.size <= MAX_TEXT_BYTES) {
+    try {
+      const text = new TextDecoder('utf-8', { fatal:true }).decode(await file.arrayBuffer());
+      if (!text.includes('\0')) return createEntry({ projectId:currentProject.id, path, kind:'text', text, size:file.size, mime:file.type, order:files.length });
+    } catch { /* Keep invalid UTF-8 as a binary file. */ }
+  }
+  return createEntry({ projectId:currentProject.id, path, kind:'binary', blob:file, mime:file.type || 'application/octet-stream', size:file.size, order:files.length });
+}
+
+function remapImportedPaths(fileItems, folders, targetFolder) {
+  const roots = new Map(); const used = occupiedProjectPaths();
+  const topNames = [...new Set([...folders, ...fileItems.map(item => item.path)].map(path => path.split('/')[0]))];
+  topNames.forEach(name => { const destination = nextAvailablePath(used, joinPath(targetFolder, name)); roots.set(name, destination); used.add(destination); });
+  const remap = path => { const parts = path.split('/'); return `${roots.get(parts[0])}${parts.length > 1 ? `/${parts.slice(1).join('/')}` : ''}`; };
+  return { fileItems:fileItems.map(item => ({ ...item, path:remap(item.path) })), folders:folders.map(remap) };
+}
+
+async function importBrowserItems(fileItems, folders = [], targetFolder = '') {
+  if (!fileItems.length && !folders.length) return;
+  importCancelled = false; setImportStatus('追加するファイルを確認中…'); const persisted = [];
+  try {
+    await ensureStorageCapacity(fileItems.reduce((total, item) => total + item.file.size, 0));
+    const mapped = remapImportedPaths(fileItems, folders, targetFolder); const created = [];
+    for (let index = 0; index < mapped.fileItems.length; index += 1) {
+      if (importCancelled) throw new Error('ファイルの追加を中止しました。');
+      setImportStatus(`${index + 1} / ${mapped.fileItems.length} ファイルを準備中…`);
+      created.push(await browserFileToEntry(mapped.fileItems[index].file, normalizeProjectPath(mapped.fileItems[index].path)));
+    }
+    const occupied = new Set([...visibleFiles().map(entry => entry.path), ...created.map(entry => entry.path)]);
+    mapped.folders.sort((a, b) => a.length - b.length).forEach(path => { if (!occupied.has(path)) { created.push(createEntry({ projectId:currentProject.id, path:normalizeProjectPath(path), kind:'folder', order:files.length + created.length })); occupied.add(path); } });
+    for (let index = 0; index < created.length; index += 200) {
+      if (importCancelled) throw new Error('ファイルの追加を中止しました。');
+      const batch = created.slice(index, index + 200); setImportStatus(`${Math.min(index + 200, created.length)} / ${created.length} 件を保存中…`); await saveEntries(batch); persisted.push(...batch);
+    }
+    files.push(...created); created.forEach(entry => selectedChanges.add(entry.id)); if (targetFolder) expandedFolders.add(targetFolder); renderFileList();
+    addLog('system', `${created.length}件をFILESへ追加しました。`);
+  } catch (error) { if (persisted.length) await removeEntries(persisted.map(entry => entry.id)).catch(() => {}); addLog(error.message.includes('中止') ? 'warning' : 'error', error.message); }
+  finally { setImportStatus(''); importCancelled = false; }
+}
+
+async function handleExplorerDrop(event, node = null) {
+  const targetFolder = nodeTargetFolder(node);
+  if (draggedExplorerNode || [...event.dataTransfer.types].includes('application/x-unitv-entry')) {
+    let source = draggedExplorerNode;
+    if (!source) { try { source = JSON.parse(event.dataTransfer.getData('application/x-unitv-entry')); } catch { return; } }
+    if (source.projectId && source.projectId !== currentProject.id) { addLog('error', '別のプロジェクトからは移動できません。'); return; }
+    await moveExplorerNode(source, targetFolder); return;
+  }
+  setImportStatus('ドロップされた項目を読み取り中…');
+  try { const items = await collectDroppedItems(event.dataTransfer); await importBrowserItems(items.fileItems, items.folders, targetFolder); }
+  catch (error) { setImportStatus(''); addLog('error', `ファイルを追加できません: ${error.message}`); }
+}
+
 function showEmptyProject() {
   refs.editor.hidden = true; $('#asset-viewer').hidden = true; $('#binary-viewer').hidden = false;
   $('#binary-meta').textContent = 'ファイルを作成してください。'; $('#active-file-name').textContent = 'ファイルなし';
@@ -759,7 +1038,6 @@ function showEmptyProject() {
 }
 
 async function switchProject(projectId) {
-  clearTimeout(autosaveTimer); await persistCurrentFile();
   const project = projects.find(item => item.id === projectId); if (!project) return;
   currentProject = project; files = await listProjectEntries(project.id); currentFileId = null;
   expandedFolders = new Set(); selectedChanges = new Set(changedEntries().map(entry => entry.id));
@@ -789,8 +1067,8 @@ async function confirmProjectDialog() {
 }
 
 async function deleteCurrentProject() {
-  if (!projectDeleteArmed) { projectDeleteArmed = true; $('#project-delete').textContent = 'もう一度押して削除'; return; }
-  const deletingId = currentProject.id; await deleteProject(deletingId); projects = projects.filter(project => project.id !== deletingId);
+  if (!projectDeleteArmed) { projectDeleteArmed = true; $('#project-delete').textContent = dirtyEntries().length ? '未保存の編集も削除する' : 'もう一度押して削除'; return; }
+  const deletingId = currentProject.id; files.forEach(entry => draftBuffers.delete(entry.id)); await deleteProject(deletingId); projects = projects.filter(project => project.id !== deletingId);
   if (!projects.length) {
     const replacement = createProject('新しいプロジェクト'); projects.push(replacement);
     await saveProjectRecord(replacement); await saveEntry(createEntry({ projectId:replacement.id, path:'main.py', kind:'text', text:'', order:0 }));
@@ -806,16 +1084,21 @@ async function initializeEditor() {
       extensions: [
         lineNumbers(), highlightActiveLineGutter(), history(), foldGutter(), drawSelection(), highlightActiveLine(),
         indentUnit.of('    '), languageCompartment.of([]), lintCompartment.of([]), bracketMatching(), closeBrackets(),
-        syntaxHighlighting(editorHighlight), indentGuides,
+        syntaxHighlighting(editorHighlight), indentGuides, gitDiffExtension,
+        autocompletion({ override:[pythonCompletionSource], activateOnTyping:true }),
         keymap.of([
           { key: 'Mod-Enter', run: () => { if (isPythonEntry(activeEntry())) void runCode(); return true; } },
-          indentWithTab, ...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap
+          indentWithTab, ...completionKeymap, ...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap
         ]),
         EditorView.updateListener.of(update => {
           if (update.docChanged && activeEntry()?.kind === 'text') {
             updateSyntaxStatus(update.view);
-            if (!suppressAutosave) scheduleAutosave();
-            renderGithubState(); renderGitVersion();
+            if (!suppressDraftTracking) trackCurrentDraft();
+            const cursor = update.state.selection.main.head;
+            if (isPythonEntry(activeEntry()) && !suppressDraftTracking && /[A-Za-z0-9_.]/.test(update.state.sliceDoc(Math.max(0, cursor - 1), cursor))) {
+              queueMicrotask(() => startCompletion(update.view));
+            }
+            renderGithubState();
           }
         })
       ]
@@ -1209,7 +1492,6 @@ async function flashActiveProgram() {
   refs.run.disabled = true; refs.stop.disabled = true; refs.executionTarget.disabled = true;
   renderUnitVConnection('書き込み準備中…');
   try {
-    await persistCurrentFile();
     setRuntime('書き込み準備中', 'UnitVをMaixPy IDEモードへ切り替えています', 'busy');
     addLog('system', `${file.path} を /flash/main.py へ書き込みます。`);
     await realUnitV.activateIde(); renderUnitVConnection('IDEモード接続中');
@@ -1244,7 +1526,6 @@ async function flashActiveProgram() {
 
 async function runOnUnitV(activeFile) {
   if (!serialTransport.connected) { finishWithError('「実機接続」を押してUnitVを選択してください。'); refs.unitvConnect.focus(); return; }
-  await persistCurrentFile();
   setRunning(true); realStdoutBuffer = '';
   const generation = ++realPollGeneration;
   setRuntime('UnitV準備中', 'MaixPy IDEモードへ切り替えています', 'busy'); addLog('system', `実機で実行します: ${activeFile.path}`);
@@ -1295,11 +1576,10 @@ async function runCode() {
     try { await captureCameraFrame(); } catch (error) { finishWithError(error.message); return; }
   }
   if (!sourceImage) { finishWithError('先に入力画像を選択してください。'); refs.imageFile.focus(); return; }
-  await persistCurrentFile();
   setRunning(true); setRuntime('開始中', '入力データを準備しています', 'busy'); addLog('system', 'コードを実行します。');
   const imageCopy = new Uint8ClampedArray(sourceImage.data);
   const uartCopy = new Uint8Array(uartQueued);
-  const payload = { type:'run', code:getCode(), filename:activeFile.path, files:visibleFiles().filter(file=>isPythonEntry(file)).map(file=>({name:file.path,code:file.id===currentFileId?getCode():file.text})), cameraMode:Boolean(cameraStream), image:{width:sourceImage.width,height:sourceImage.height,data:imageCopy.buffer}, uart:uartCopy.buffer, gpio:{...gpioState} };
+  const payload = { type:'run', code:getCode(), filename:activeFile.path, files:visibleFiles().filter(file=>isPythonEntry(file)).map(file=>({name:file.path,code:file.id===currentFileId?getCode():currentEntryText(file)})), cameraMode:Boolean(cameraStream), image:{width:sourceImage.width,height:sourceImage.height,data:imageCopy.buffer}, uart:uartCopy.buffer, gpio:{...gpioState} };
   const transfers = [imageCopy.buffer, uartCopy.buffer];
   ensureWorker().postMessage(payload, transfers);
 }
@@ -1325,7 +1605,7 @@ function base64ToArrayBuffer(value) {
 }
 
 async function saveProject() {
-  await persistCurrentFile();
+  try { assertProjectSaved('プロジェクト書き出し'); } catch (error) { $('#save-dialog').close(); addLog('warning', error.message); return; }
   const embedAssets = $('#embed-image').checked;
   const entries = await Promise.all(files.filter(entry => !entry.deleted).map(async entry => ({
     path:entry.path, kind:entry.kind, text:entry.kind === 'text' ? entry.text : undefined,
@@ -1341,6 +1621,7 @@ async function saveProject() {
 }
 
 async function openProject(file) {
+  assertProjectSaved('プロジェクト読込');
   await ensureStorageCapacity(file.size);
   const data=JSON.parse(await file.text()); if(![1,2,3,4].includes(data.version)) throw new Error(`未対応のプロジェクトバージョンです: ${data.version}`);
   const reusableGithubSource = data.version >= 3 && data.source?.type === 'github' && data.source.owner && data.source.repo && data.source.branch && data.source.headSha;
@@ -1620,8 +1901,8 @@ function renderGithubState() {
     discard.hidden = false; return;
   }
   discard.hidden = true; panel.className = 'github-worktree';
-  const changes = changedEntries(); panel.classList.toggle('changed', Boolean(changes.length));
-  detail.textContent = changes.length ? `${changes.length}件の未コミット変更があります。` : `GitHubと同期済み（${currentProject.source.headSha?.slice(0, 7) || '-------'}）`;
+  const changes = changedEntries(); const unsaved = dirtyEntries().length; panel.classList.toggle('changed', Boolean(changes.length || unsaved));
+  detail.textContent = unsaved ? `${unsaved}件が未保存です。保存するとGit変更へ反映されます。` : changes.length ? `${changes.length}件の未コミット変更があります。` : `GitHubと同期済み（${currentProject.source.headSha?.slice(0, 7) || '-------'}）`;
 }
 
 async function runGithubAction(progressMessage, action) {
@@ -1740,6 +2021,7 @@ async function fetchRepositorySnapshot(settings, onProgress = () => {}) {
 
 async function cloneFromGithub() {
   await runGithubAction('リポジトリをクローンしています…', async () => {
+    assertProjectSaved('クローン');
     if (!githubAccount && !(await refreshGithubSession())) throw new Error('先にGitHubへログインしてください。');
     const settings = githubSettings(); saveGithubSettings(settings);
     const snapshot = await fetchRepositorySnapshot(settings, progress => githubSetStatus(describeRepositoryProgress(progress), 'busy'));
@@ -1756,7 +2038,7 @@ async function cloneFromGithub() {
 
 async function pullFromGithub() {
   await runGithubAction('GitHubからプルしています…', async () => {
-    await persistCurrentFile();
+    assertProjectSaved('プル');
     if (githubPendingCommit) throw new Error('未プッシュのコミットがあります。先にプッシュするか破棄してください。');
     if (hasLocalChanges()) throw new Error('未コミットの変更があります。コミットするか変更を戻してからプルしてください。');
     const settings = linkedGithubSettings(); const snapshot = await fetchRepositorySnapshot(settings, progress => githubSetStatus(describeRepositoryProgress(progress), 'busy'));
@@ -1773,7 +2055,7 @@ async function pullFromGithub() {
 
 async function commitToGithub() {
   await runGithubAction('コミットを作成しています…', async () => {
-    await persistCurrentFile();
+    assertProjectSaved('コミット');
     if (githubPendingCommit) throw new Error('未プッシュのコミットがあります。先にプッシュするか破棄してください。');
     const settings = linkedGithubSettings(); const changes = changedEntries();
     if (!changes.length) throw new Error('コミットする変更がありません。');
@@ -1811,6 +2093,7 @@ async function commitToGithub() {
 
 async function pushToGithub() {
   await runGithubAction('GitHubへプッシュしています…', async () => {
+    assertProjectSaved('プッシュ');
     if (!githubPendingCommit) throw new Error('先にコミットを作成してください。');
     const settings = linkedGithubSettings();
     if (githubPendingCommit.key !== githubSettingsKey(settings)) throw new Error('保留中のコミットは別のリポジトリまたはブランチ向けです。');
@@ -1825,7 +2108,7 @@ async function pushToGithub() {
       entry.basePath = snapshot.path; entry.baseSha = snapshot.sha; if (entry.kind === 'text') entry.baseText = snapshot.text; await saveEntry(entry);
     }
     currentProject.source = { ...currentProject.source, headSha:pushed.commitSha, treeSha:pushed.treeSha, lastSyncAt:new Date().toISOString(), pendingCommit:null };
-    githubPendingCommit = null; await saveProjectRecord(currentProject); selectedChanges = new Set(changedEntries().map(entry => entry.id)); renderFileList();
+    githubPendingCommit = null; await saveProjectRecord(currentProject); selectedChanges = new Set(changedEntries().map(entry => entry.id)); renderFileList(); if (activeEntry()) configureEditorForEntry(activeEntry());
     githubSetStatus(`プッシュしました: ${pushed.commitSha.slice(0, 7)} ${pushed.message}`, 'success'); await loadGithubHistory(settings);
   });
 }
@@ -1914,8 +2197,8 @@ function applyTheme(theme) {
 
 applyTheme(initialTheme);
 $('#theme-toggle').addEventListener('click', () => applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light'));
-$('#new-file').addEventListener('click', openNewFileDialog);
-$('#new-folder').addEventListener('click', openNewFolderDialog);
+$('#new-file').addEventListener('click', () => openNewFileDialog());
+$('#new-folder').addEventListener('click', () => openNewFolderDialog());
 $('#file-confirm').addEventListener('click', confirmFileDialog); $('#file-duplicate').addEventListener('click', duplicateFileDialog); $('#file-delete').addEventListener('click', deleteFileDialog);
 $('#file-name-input').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); confirmFileDialog(); } });
 $('#project-select').addEventListener('change', event => void switchProject(event.target.value));
@@ -1927,6 +2210,24 @@ $('#diff-select-all').addEventListener('click', () => { const changes = changedE
 $('#diff-dialog').addEventListener('close', destroyMergeView);
 $('#asset-to-frame').addEventListener('click', () => { const entry = activeEntry(); if (!entry?.blob) return; imageLoadPromise = loadImageFile(new File([entry.blob], entry.path, { type:entry.mime || entry.blob.type })).catch(error => finishWithError(error.message)).finally(() => { imageLoadPromise = null; }); });
 $('#binary-download').addEventListener('click', () => { const entry = activeEntry(); if (entry?.kind === 'binary' && entry.blob) downloadBlob(entry.blob, entry.path.split('/').pop()); });
+const fileList = $('#file-list');
+fileList.addEventListener('contextmenu', event => {
+  if (event.target.closest('.file-row')) return;
+  event.preventDefault(); showFileContextMenu(event.clientX, event.clientY, null);
+});
+fileList.addEventListener('dragover', event => { event.preventDefault(); event.dataTransfer.dropEffect = draggedExplorerNode ? 'move' : 'copy'; fileList.classList.add('drop-root'); });
+fileList.addEventListener('dragleave', event => { if (!fileList.contains(event.relatedTarget)) fileList.classList.remove('drop-root'); });
+fileList.addEventListener('drop', event => { event.preventDefault(); fileList.classList.remove('drop-root'); void handleExplorerDrop(event, null); });
+$('#file-import-status button').addEventListener('click', () => { importCancelled = true; setImportStatus('中止しています…'); });
+$('#file-upload').addEventListener('change', event => {
+  const input = event.currentTarget; const items = [...input.files].map(file => ({ file, path:file.name })); input.value = '';
+  void importBrowserItems(items, [], pendingUploadFolder);
+});
+$('#folder-upload').addEventListener('change', event => {
+  const input = event.currentTarget; const items = [...input.files].map(file => ({ file, path:file.webkitRelativePath || file.name })); const folders = new Set();
+  items.forEach(item => { const parts = item.path.split('/'); for (let index = 1; index < parts.length; index += 1) folders.add(parts.slice(0, index).join('/')); }); input.value = '';
+  void importBrowserItems(items, [...folders], pendingUploadFolder);
+});
 refs.imageFile.addEventListener('change', event => { imageLoadPromise=loadImageFile(event.target.files[0]).catch(error=>finishWithError(error.message)).finally(()=>{imageLoadPromise=null;}); });
 $('#sample-image').addEventListener('click', () => { imageLoadPromise=loadSampleImage().finally(()=>{imageLoadPromise=null;}); });
 $('#camera-toggle').addEventListener('click', toggleCamera);
@@ -1984,11 +2285,26 @@ $('#github-repository').addEventListener('change', async event => {
   await applyGithubRepository(repository, true);
 });
 renderGithubAccount(); renderGithubState(); setGithubControlsBusy(false); renderExecutionTarget();
-$('#project-save').addEventListener('click',()=>$('#save-dialog').showModal()); $('#confirm-save').addEventListener('click',saveProject);
-$('#project-open').addEventListener('click',()=>$('#project-file').click()); $('#project-file').addEventListener('change',async event=>{try{await openProject(event.target.files[0]);}catch(error){finishWithError(`プロジェクトを開けません: ${error.message}`);}event.target.value='';});
+$('#project-save').addEventListener('click',()=>{ try { assertProjectSaved('プロジェクト書き出し'); $('#save-dialog').showModal(); } catch (error) { addLog('warning', error.message); } }); $('#confirm-save').addEventListener('click',saveProject);
+$('#project-open').addEventListener('click',()=>{ try { assertProjectSaved('プロジェクト読込'); $('#project-file').click(); } catch (error) { addLog('warning', error.message); } }); $('#project-file').addEventListener('change',async event=>{try{await openProject(event.target.files[0]);}catch(error){finishWithError(`プロジェクトを開けません: ${error.message}`);}event.target.value='';});
 document.querySelectorAll('dialog').forEach(dialog => dialog.addEventListener('click', event => { if(event.target===dialog)dialog.close(); }));
-document.addEventListener('keydown', event => { if (event.key === 'Escape' && document.querySelector('.code-panel')?.classList.contains('editor-fullscreen')) toggleEditorFullscreen(); });
-window.addEventListener('beforeunload',()=>{ worker?.terminate(); cameraStream?.getTracks().forEach(track=>track.stop()); if (serialTransport.connected) { void realUnitV.stop(); void realUnitV.setFrameBufferEnabled(false); } });
+document.addEventListener('pointerdown', event => { if (!event.target.closest('#file-context-menu') && !event.target.closest('.file-menu')) hideFileContextMenu(); });
+document.addEventListener('scroll', hideFileContextMenu, true);
+document.addEventListener('keydown', event => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+    event.preventDefault(); void (event.shiftKey ? saveAllDirtyFiles() : saveCurrentFile()); return;
+  }
+  if ((event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) && document.activeElement?.closest?.('.file-row')) {
+    event.preventDefault(); const row = document.activeElement.closest('.file-row'); const rect = row.getBoundingClientRect();
+    const entry = visibleFiles().find(item => item.path === row.dataset.path); showFileContextMenu(rect.left + 24, rect.top + 24, { type:row.dataset.type, path:row.dataset.path, file:entry }); return;
+  }
+  if (event.key === 'Escape' && !$('#file-context-menu').hidden) { hideFileContextMenu(); return; }
+  if (event.key === 'Escape' && document.querySelector('.code-panel')?.classList.contains('editor-fullscreen')) toggleEditorFullscreen();
+});
+window.addEventListener('beforeunload', event => {
+  if (hasUnsavedChanges()) { event.preventDefault(); event.returnValue = ''; }
+  worker?.terminate(); cameraStream?.getTracks().forEach(track=>track.stop()); if (serialTransport.connected) { void realUnitV.stop(); void realUnitV.setFrameBufferEnabled(false); }
+});
 
 addLog('system', '画像を選択し、コードを確認して「実行」を押してください。');
 await initializeEditor();

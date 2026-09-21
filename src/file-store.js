@@ -144,6 +144,14 @@ export async function removeEntry(id) {
   await withDatabase('readwrite', [ENTRY_STORE], transaction => transaction.objectStore(ENTRY_STORE).delete(id));
 }
 
+export async function removeEntries(ids) {
+  if (!ids.length) return;
+  await withDatabase('readwrite', [ENTRY_STORE], transaction => {
+    const store = transaction.objectStore(ENTRY_STORE);
+    ids.forEach(id => store.delete(id));
+  });
+}
+
 function deleteEntriesForProject(transaction, projectId) {
   return new Promise((resolve, reject) => {
     const request = transaction.objectStore(ENTRY_STORE).index('projectId').openKeyCursor(IDBKeyRange.only(projectId));
