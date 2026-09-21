@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildFileSavePayload, commandHeader, MaixPyIdeClient, MAIXPY_COMMAND,
-  MAIXPY_BOOT_IDE_BAUD, MAIXPY_CONSOLE_BAUD, MAIXPY_IDE_BAUD, MAIXPY_STATUS_MAGIC
+  MAIXPY_CONSOLE_BAUD, MAIXPY_IDE_BAUD, MAIXPY_STATUS_MAGIC
 } from '../src/maixpy-ide.js';
 
 function le32(value) {
@@ -25,11 +25,18 @@ class MockTransport {
     this.reopens = [];
     this.connected = true;
     this.baudRate = MAIXPY_CONSOLE_BAUD;
+    this.buffered = [
+      new TextEncoder().encode('init i2c2\\r\\n'),
+      new TextEncoder().encode('[MAIXPY]: find ov7740\\r\\n'),
+      new TextEncoder().encode('KeyboardInterrupt\\r\\n>>> '),
+      new TextEncoder().encode('raw REPL; CTRL-B to exit\\r\\n>'),
+      new TextEncoder().encode('OK')
+    ];
   }
   async write(bytes) { this.writes.push(new Uint8Array(bytes)); }
   async reopen(baudRate) { this.reopens.push(baudRate); this.baudRate = baudRate; }
   discardBuffered() {}
-  takeBuffered() { return new Uint8Array([0x3e]); }
+  takeBuffered() { return this.buffered.shift() || new Uint8Array(); }
   async readExact(length) {
     const response = this.responses.shift();
     assert.equal(response.byteLength, length);
@@ -44,28 +51,17 @@ test('IDE mode stays at the open console baud rate on Windows Web Serial', async
   const client = new MaixPyIdeClient(transport, { onTrace:trace => traces.push(trace) });
   await client.activateIde();
   assert.deepEqual(transport.reopens, []);
-  const bootstrap = new TextDecoder().decode(transport.writes[3]);
+  const bootstrapPacket = transport.writes.find(packet => new TextDecoder().decode(packet).includes('from machine import UART'));
+  const bootstrap = new TextDecoder().decode(bootstrapPacket);
   assert.match(bootstrap, /init\(115200,/);
   assert.match(bootstrap, /except TypeError:/);
   assert.equal(bootstrap.charCodeAt(bootstrap.length - 1), 0x04);
   assert.equal(client.ideReady, true);
+  assert.equal(transport.writes.filter(packet => packet[0] === 0x03 && packet[1] === 0x03 && packet[2] === 0x02).length, 3);
+  assert.match(traces.find(trace => trace.step === 'IDE-02R').message, /3回/);
   assert.deepEqual(traces.map(trace => trace.step), [
     'IDE-02', 'IDE-02R', 'IDE-03', 'IDE-03R', 'IDE-04', 'IDE-04R', 'IDE-05', 'IDE-06'
   ]);
-});
-
-test('detects the one-shot boot IDE mode at 1.5 Mbaud after a flashed reboot', async () => {
-  const transport = new MockTransport();
-  transport.takeBuffered = () => new Uint8Array();
-  transport.readUntil = async expected => expected;
-  const traces = [];
-  const client = new MaixPyIdeClient(transport, { onTrace:trace => traces.push(trace) });
-  await client.activateIde();
-  assert.deepEqual(transport.reopens, [MAIXPY_BOOT_IDE_BAUD]);
-  assert.equal(transport.baudRate, MAIXPY_BOOT_IDE_BAUD);
-  assert.equal(client.ideReady, true);
-  assert.deepEqual([...transport.writes.at(-1)], [...commandHeader(MAIXPY_COMMAND.QUERY_STATUS, 4)]);
-  assert.ok(traces.some(trace => trace.step === 'IDE-02BR'));
 });
 
 test('command header uses MaixPy little-endian framing', () => {
