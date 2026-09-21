@@ -103,8 +103,37 @@ test('silent REPL recovery reopens the same baud rate and retries', async () => 
   await client.activateIde();
   assert.equal(client.ideReady, true);
   assert.deepEqual(transport.reopens, [MAIXPY_CONSOLE_BAUD]);
-  assert.match(traces.find(trace => trace.step === 'IDE-02B').message, /0 byte/);
-  assert.match(traces.find(trace => trace.step === 'IDE-02BR').message, /開き直しました/);
+  assert.match(traces.find(trace => trace.step === 'IDE-02B.1').message, /0 byte/);
+  assert.match(traces.find(trace => trace.step === 'IDE-02BR.1').message, /開き直しました/);
+});
+
+test('stalled boot output triggers another automatic recovery cycle', async () => {
+  const transport = new MockTransport([le32(MAIXPY_STATUS_MAGIC)]);
+  let bootLogReturned = false;
+  const successfulReplies = [
+    new TextEncoder().encode('KeyboardInterrupt\r\n>>> '),
+    new TextEncoder().encode('raw REPL; CTRL-B to exit\r\n>'),
+    new TextEncoder().encode('OK')
+  ];
+  transport.takeBuffered = () => {
+    if (transport.reopens.length === 1 && !bootLogReturned) {
+      bootLogReturned = true;
+      return new TextEncoder().encode('[MAIXPY] boot stalled');
+    }
+    if (transport.reopens.length >= 2) return successfulReplies.shift() || new Uint8Array();
+    return new Uint8Array();
+  };
+  const traces = [];
+  const client = new MaixPyIdeClient(transport, {
+    onTrace:trace => traces.push(trace),
+    replInitialTimeoutMs:1,
+    replRecoveryTimeoutMs:1,
+    replRecoveryAttempts:2
+  });
+  await client.activateIde();
+  assert.equal(client.ideReady, true);
+  assert.deepEqual(transport.reopens, [MAIXPY_CONSOLE_BAUD, MAIXPY_CONSOLE_BAUD]);
+  assert.match(traces.find(trace => trace.step === 'IDE-02B.2').message, /boot stalled/);
 });
 
 test('IDE mode stays at the open console baud rate on Windows Web Serial', async () => {

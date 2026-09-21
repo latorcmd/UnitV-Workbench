@@ -21,7 +21,7 @@ export const MAIXPY_CONSOLE_BAUD = 115_200;
 // but substantially more reliable for browser use.
 export const MAIXPY_IDE_BAUD = MAIXPY_CONSOLE_BAUD;
 export const MAIXPY_STATUS_MAGIC = 0xffeebbaa;
-export const MAIXPY_DIAGNOSTIC_VERSION = 7;
+export const MAIXPY_DIAGNOSTIC_VERSION = 8;
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
@@ -52,12 +52,15 @@ function statusMagicBytes() {
 
 function receivedPreview(bytes, limit = 160) {
   if (!bytes?.byteLength) return '0 byte';
-  const shown = bytes.subarray(0, limit);
-  const text = new TextDecoder('utf-8', { fatal:false }).decode(shown)
+  const clipped = bytes.byteLength > limit;
+  const headLength = clipped ? Math.ceil(limit / 2) : bytes.byteLength;
+  const tailLength = clipped ? Math.floor(limit / 2) : 0;
+  const head = bytes.subarray(0, headLength);
+  const tail = tailLength ? bytes.subarray(bytes.byteLength - tailLength) : new Uint8Array();
+  const escape = value => new TextDecoder('utf-8', { fatal:false }).decode(value)
     .replace(/\\/g, '\\\\').replace(/\r/g, '\\r').replace(/\n/g, '\\n')
     .replace(/\t/g, '\\t').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, character => `\\x${character.charCodeAt(0).toString(16).padStart(2, '0')}`);
-  const suffix = bytes.byteLength > shown.byteLength ? '…' : '';
-  return `${bytes.byteLength} byte: "${text}${suffix}"`;
+  return `${bytes.byteLength} byte: "${escape(head)}${clipped ? ' … [末尾] … ' : ''}${escape(tail)}"`;
 }
 
 export async function buildFileSavePayload(path, content, cryptoApi = globalThis.crypto) {
@@ -86,13 +89,14 @@ const FILE_SAVE_ERRORS = Object.freeze({
 });
 
 export class MaixPyIdeClient {
-  constructor(transport, { onTrace = () => {}, replInitialTimeoutMs = 12_000, replRecoveryTimeoutMs = 30_000 } = {}) {
+  constructor(transport, { onTrace = () => {}, replInitialTimeoutMs = 10_000, replRecoveryTimeoutMs = 12_000, replRecoveryAttempts = 3 } = {}) {
     this.transport = transport;
     this.queue = Promise.resolve();
     this.ideReady = false;
     this.onTrace = onTrace;
     this.replInitialTimeoutMs = replInitialTimeoutMs;
     this.replRecoveryTimeoutMs = replRecoveryTimeoutMs;
+    this.replRecoveryAttempts = replRecoveryAttempts;
   }
 
   #trace(step, message, level = 'debug') {
@@ -129,7 +133,7 @@ export class MaixPyIdeClient {
       attempts += 1;
       if (raw) await this.transport.write(new Uint8Array([0x01]));
       else await this.transport.write(new Uint8Array([0x03, 0x03, 0x02]));
-      await delay(raw ? 220 : 420);
+      await delay(raw ? 220 : 700);
       throwIfAborted(signal);
       const chunk = this.transport.takeBuffered(4096);
       for (const byte of chunk) if (received.length < 8192) received.push(byte);
@@ -138,12 +142,16 @@ export class MaixPyIdeClient {
       if (raw ? text.includes('raw REPL') : text.includes('>>>')) return { bytes, attempts };
       if (!raw && Date.now() >= nextProgressAt) {
         const seconds = Math.round((Date.now() - startedAt) / 1000);
-        this.#trace(progressStep, `REPL応答を待機中です（${seconds}秒、Ctrl+C ${attempts}回、${receivedPreview(bytes)}）。`);
+        this.#trace(progressStep, `REPL応答を待機中です（${seconds}秒、割り込み送信 ${attempts}回、${receivedPreview(bytes)}）。`);
         nextProgressAt += 5_000;
       }
     }
     const mode = raw ? 'raw REPL' : 'friendly REPL';
-    throw new Error(`${mode}のプロンプトを確認できませんでした（${receivedPreview(new Uint8Array(received))}）。`);
+    const bytes = new Uint8Array(received);
+    const error = new Error(`${mode}のプロンプトを確認できませんでした（${receivedPreview(bytes)}）。`);
+    error.receivedBytes = bytes;
+    error.attempts = attempts;
+    throw error;
   }
 
   async #detectActiveIde(signal) {
@@ -200,26 +208,35 @@ export class MaixPyIdeClient {
           return;
         }
         stage = 'IDE-02';
-        this.#trace(stage, '実行中スクリプトを停止し、friendly REPLプロンプトを待ちます（最初の確認は12秒）。');
+        this.#trace(stage, `実行中スクリプトを停止し、friendly REPLプロンプトを待ちます（最初の確認は${Math.round(this.replInitialTimeoutMs / 1000)}秒）。`);
         this.transport.discardBuffered();
         let friendlyReply;
         try {
           friendlyReply = await this.#waitForReplPrompt({ timeoutMs:this.replInitialTimeoutMs, signal });
         } catch (error) {
           if (error?.name === 'AbortError') throw error;
-          const silent = /0 byte/.test(error?.message || '');
-          stage = 'IDE-02B';
-          if (silent && typeof this.transport.reopen === 'function') {
-            this.#trace(stage, '応答が0 byteのため、USBポートを115200 baudで開き直してUnitVの復帰を試します。', 'warning');
+          let lastError = error;
+          for (let recoveryAttempt = 1; recoveryAttempt <= this.replRecoveryAttempts; recoveryAttempt += 1) {
+            stage = `IDE-02C.${recoveryAttempt}`;
+            const previous = lastError?.receivedBytes instanceof Uint8Array ? receivedPreview(lastError.receivedBytes) : lastError.message;
+            this.#trace(`IDE-02B.${recoveryAttempt}`, `REPLへ到達しなかったため、USBポートを115200 baudで開き直します（復帰 ${recoveryAttempt}/${this.replRecoveryAttempts}、直前 ${previous}）。`, 'warning');
             await this.transport.reopen(MAIXPY_CONSOLE_BAUD);
             throwIfAborted(signal);
-            this.#trace('IDE-02BR', 'USBポートを開き直しました。起動直後からCtrl+Cを送信します。');
-          } else {
-            this.#trace(stage, `起動ログは受信できたため、ポートを閉じずにREPL待機を続けます（${error.message}）`, 'warning');
+            this.#trace(`IDE-02BR.${recoveryAttempt}`, `USBポートを開き直しました。起動直後から割り込みを送信します（復帰 ${recoveryAttempt}/${this.replRecoveryAttempts}）。`);
+            this.transport.discardBuffered();
+            try {
+              friendlyReply = await this.#waitForReplPrompt({
+                timeoutMs:this.replRecoveryTimeoutMs,
+                signal,
+                progressStep:`IDE-02CW.${recoveryAttempt}`
+              });
+              break;
+            } catch (recoveryError) {
+              if (recoveryError?.name === 'AbortError') throw recoveryError;
+              lastError = recoveryError;
+            }
           }
-          stage = 'IDE-02C';
-          this.transport.discardBuffered();
-          friendlyReply = await this.#waitForReplPrompt({ timeoutMs:this.replRecoveryTimeoutMs, signal, progressStep:'IDE-02CW' });
+          if (!friendlyReply) throw lastError;
         }
         this.#trace('IDE-02R', `friendly REPLを確認しました（${friendlyReply.attempts}回、${receivedPreview(friendlyReply.bytes)}）。`);
         stage = 'IDE-03';
