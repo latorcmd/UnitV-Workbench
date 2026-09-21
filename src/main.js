@@ -1,13 +1,14 @@
 import './styles.css';
-import { Compartment, EditorState, RangeSetBuilder } from '@codemirror/state';
+import { Compartment, EditorState, RangeSetBuilder, StateEffect, StateField } from '@codemirror/state';
 import { EditorView, Decoration, ViewPlugin, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection } from '@codemirror/view';
 import { HighlightStyle, bracketMatching, ensureSyntaxTree, foldGutter, indentUnit, syntaxHighlighting, syntaxTree } from '@codemirror/language';
 import { python } from '@codemirror/lang-python';
-import { lintGutter, linter } from '@codemirror/lint';
+import { lintGutter, linter, setDiagnostics } from '@codemirror/lint';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap, startCompletion } from '@codemirror/autocomplete';
 import { tags } from '@lezer/highlight';
 import { MergeView } from '@codemirror/merge';
+import { openSearchPanel, search, searchKeymap } from '@codemirror/search';
 import { LatestBranchLoader } from './github-branch-loader.js';
 import { loadCompleteGitTree } from './github-tree.js';
 import { MaixPyIdeClient } from './maixpy-ide.js';
@@ -18,6 +19,8 @@ import { basename, flattenProjectTree, joinPath, nextAvailablePath, parentPath, 
 import { collectPythonCompletions } from './python-completions.js';
 import { gitDiffExtension, setGitBaseline } from './editor-git-diff.js';
 import { createEntriesZip } from './zip-download.js';
+import { formatPythonCode } from './python-formatter.js';
+import { explainPythonError, parsePythonRuntimeError } from './python-runtime-errors.js';
 import {
   createEntry, createProject, deleteProject, listProjectEntries, listProjects,
   removeEntries, removeEntry, replaceProjectEntries, saveEntries, saveEntry, saveProjectRecord
@@ -78,6 +81,7 @@ document.querySelector('#app').innerHTML = `
           <div><span class="panel-kicker">EDITOR</span><h2 id="active-file-name">main.py</h2></div>
           <div class="panel-tools">
             <span class="git-version" id="git-version">LOCAL</span>
+            <button id="editor-search" type="button" title="検索・置換 (Ctrl+F)">検索</button>
             <button id="diff-open" type="button" disabled>差分</button>
             <button id="editor-fullscreen" type="button" aria-pressed="false">全画面</button>
           </div>
@@ -98,6 +102,7 @@ document.querySelector('#app').innerHTML = `
               <div><strong id="asset-name"></strong><small id="asset-meta"></small><button id="asset-to-frame" type="button">フレームバッファに適用</button></div>
             </div>
             <div id="binary-viewer" class="binary-viewer" hidden><strong>プレビューできないファイルです</strong><small id="binary-meta"></small><button id="binary-download" type="button" disabled>ファイルをダウンロード</button></div>
+            <section id="editor-error" class="editor-error" hidden aria-live="polite"></section>
             <div class="editor-status"><span id="syntax-status">構文チェック中…</span><span id="save-status">ローカル保存</span><span>Ctrl / ⌘ + Enter で実行</span></div>
           </div>
         </div>
@@ -308,6 +313,7 @@ let currentProject = null;
 let files = [];
 let currentFileId = null;
 const draftBuffers = new Map();
+const editorStates = new Map();
 let suppressDraftTracking = false;
 let fileDialogTarget = null;
 let fileDialogMode = 'file';
@@ -320,6 +326,7 @@ let fileClipboard = null;
 let fileContextTarget = null;
 let draggedExplorerNode = null;
 let importCancelled = false;
+let unformattedSaveAction = null;
 let objectUrls = new Set();
 let thresholdValues = [0, 100, -128, 127, -128, 127];
 let thresholdSelection = null;
@@ -345,6 +352,24 @@ const realStdoutDecoder = new TextDecoder();
 
 const languageCompartment = new Compartment();
 const lintCompartment = new Compartment();
+
+const setRuntimeErrorEffect = StateEffect.define();
+const runtimeErrorField = StateField.define({
+  create:() => Decoration.none,
+  update(value, transaction) {
+    value = value.map(transaction.changes);
+    if (transaction.docChanged) value = Decoration.none;
+    for (const effect of transaction.effects) {
+      if (!effect.is(setRuntimeErrorEffect)) continue;
+      if (!effect.value) return Decoration.none;
+      const ranges = [Decoration.line({ class:'cm-runtime-error-line' }).range(effect.value.lineFrom)];
+      if (effect.value.to > effect.value.from) ranges.push(Decoration.mark({ class:'cm-runtime-error-range' }).range(effect.value.from, effect.value.to));
+      return Decoration.set(ranges, true);
+    }
+    return value;
+  },
+  provide:field => EditorView.decorations.from(field)
+});
 
 const editorHighlight = HighlightStyle.define([
   { tag: tags.keyword, color: 'var(--syntax-keyword)', fontWeight: '650' },
@@ -424,6 +449,47 @@ function pythonCompletionSource(context) {
   return { from:word?.from ?? context.pos, options, validFor:/^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?$/ };
 }
 
+const searchPhrases = {
+  Find:'検索', Replace:'置換', next:'次へ', previous:'前へ', all:'すべて選択',
+  'match case':'大文字小文字', regexp:'正規表現', 'by word':'単語単位', replace:'置換',
+  'replace all':'すべて置換', close:'閉じる', 'Go to line':'指定行へ', go:'移動',
+  'current match':'現在の一致', 'on line':'行', 'replaced match on line $':'$行目を置換しました',
+  'replaced $ matches':'$件を置換しました'
+};
+
+function editorExtensions(entry = null) {
+  const isPython = isPythonEntry(entry);
+  return [
+    lineNumbers(), highlightActiveLineGutter(), history(), foldGutter(), drawSelection(), highlightActiveLine(),
+    EditorState.tabSize.of(4), indentUnit.of('    '), EditorState.phrases.of(searchPhrases),
+    languageCompartment.of(isPython ? python() : []),
+    lintCompartment.of(isPython ? [lintGutter(), linter(syntaxDiagnostics, { delay:250 })] : []),
+    bracketMatching(), closeBrackets(), syntaxHighlighting(editorHighlight), indentGuides, gitDiffExtension, runtimeErrorField,
+    search({ top:true }), autocompletion({ override:[pythonCompletionSource], activateOnTyping:true }),
+    keymap.of([
+      { key:'Mod-Enter', run:() => { if (isPythonEntry(activeEntry())) void runCode(); return true; } },
+      indentWithTab, ...searchKeymap, ...completionKeymap, ...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap
+    ]),
+    EditorView.updateListener.of(update => {
+      if (activeEntry()?.kind === 'text') editorStates.set(activeEntry().id, update.state);
+      if (update.docChanged && activeEntry()?.kind === 'text') {
+        hideRuntimeErrorPanel();
+        updateSyntaxStatus(update.view);
+        if (!suppressDraftTracking) trackCurrentDraft();
+        const cursor = update.state.selection.main.head;
+        if (isPythonEntry(activeEntry()) && !suppressDraftTracking && /[A-Za-z0-9_.]/.test(update.state.sliceDoc(Math.max(0, cursor - 1), cursor))) {
+          queueMicrotask(() => startCompletion(update.view));
+        }
+        renderGithubState();
+      }
+    })
+  ];
+}
+
+function createEditorState(entry, doc = '') {
+  return EditorState.create({ doc:String(doc), extensions:editorExtensions(entry) });
+}
+
 function configureEditorForEntry(entry) {
   if (!editorView) return;
   const isPython = isPythonEntry(entry);
@@ -446,7 +512,7 @@ function setCode(code, addToHistory = false) {
   if (!editorView) return;
   editorView.dispatch({
     changes: { from: 0, to: editorView.state.doc.length, insert: String(code) },
-    annotations: addToHistory ? [] : undefined
+    userEvent:addToHistory ? 'input' : 'load'
   });
   updateSyntaxStatus();
 }
@@ -606,7 +672,21 @@ function renderGitVersion() {
   $('#diff-open').disabled = !changes.length;
 }
 
+function clearExplorerDragState(resetSource = false) {
+  document.querySelectorAll('.file-row.drop-target').forEach(item => item.classList.remove('drop-target'));
+  document.querySelectorAll('.file-row.dragging').forEach(item => item.classList.remove('dragging'));
+  $('#file-list')?.classList.remove('drop-root');
+  if (resetSource) draggedExplorerNode = null;
+}
+
+function markExplorerDropTarget(row = null) {
+  document.querySelectorAll('.file-row.drop-target').forEach(item => item.classList.remove('drop-target'));
+  $('#file-list')?.classList.remove('drop-root');
+  if (row) row.classList.add('drop-target'); else $('#file-list')?.classList.add('drop-root');
+}
+
 function renderFileList() {
+  clearExplorerDragState();
   const list = $('#file-list');
   list.replaceChildren();
   const fragment = document.createDocumentFragment();
@@ -636,10 +716,13 @@ function renderFileList() {
       draggedExplorerNode = node; row.classList.add('dragging');
       event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-unitv-entry', JSON.stringify({ projectId:currentProject.id, path:node.path, type:node.type }));
     });
-    row.addEventListener('dragend', () => { draggedExplorerNode = null; row.classList.remove('dragging'); document.querySelectorAll('.file-row.drop-target').forEach(item => item.classList.remove('drop-target')); });
-    row.addEventListener('dragover', event => { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = draggedExplorerNode ? 'move' : 'copy'; row.classList.add('drop-target'); });
-    row.addEventListener('dragleave', () => row.classList.remove('drop-target'));
-    row.addEventListener('drop', event => { event.preventDefault(); event.stopPropagation(); row.classList.remove('drop-target'); void handleExplorerDrop(event, node); });
+    row.addEventListener('dragend', () => clearExplorerDragState(true));
+    row.addEventListener('dragover', event => { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = draggedExplorerNode ? 'move' : 'copy'; markExplorerDropTarget(row); });
+    row.addEventListener('dragleave', event => { if (!row.contains(event.relatedTarget)) row.classList.remove('drop-target'); });
+    row.addEventListener('drop', event => {
+      event.preventDefault(); event.stopPropagation(); clearExplorerDragState();
+      void handleExplorerDrop(event, node).finally(() => clearExplorerDragState(true));
+    });
     row.append(open, menu); fragment.append(row);
   });
   list.append(fragment);
@@ -647,9 +730,53 @@ function renderFileList() {
 }
 
 async function saveCurrentFile() {
+  return saveCurrentFileWithOptions();
+}
+
+function positionAtLineColumn(text, lineNumber, column) {
+  const lines = String(text).split('\n');
+  const line = Math.max(1, Math.min(Number(lineNumber) || 1, lines.length));
+  let offset = 0;
+  for (let index = 0; index < line - 1; index += 1) offset += lines[index].length + 1;
+  return offset + Math.min(Math.max(0, Number(column) || 0), lines[line - 1].length);
+}
+
+function applyFormattedText(entry, formatted) {
+  const state = entry.id === currentFileId ? editorView?.state : editorStates.get(entry.id);
+  const current = state?.doc.toString() ?? currentEntryText(entry);
+  if (current === formatted) return;
+  if (state) {
+    const head = state.selection.main.head;
+    const line = state.doc.lineAt(head);
+    const selection = { anchor:positionAtLineColumn(formatted, line.number, head - line.from) };
+    const transaction = state.update({ changes:{ from:0, to:state.doc.length, insert:formatted }, selection, userEvent:'input.format' });
+    if (entry.id === currentFileId && editorView) editorView.dispatch(transaction);
+    else editorStates.set(entry.id, transaction.state);
+  }
+  if (formatted === (entry.text || '')) draftBuffers.delete(entry.id); else draftBuffers.set(entry.id, formatted);
+}
+
+async function formattedTextForSave(entry, text) {
+  if (!isPythonEntry(entry)) return text;
+  renderSaveStatus(`整形中… ${entry.path}`);
+  return formatPythonCode(text, entry.path);
+}
+
+async function saveCurrentFileWithOptions({ skipFormat = false } = {}) {
   const file = activeEntry();
   if (!file || file.kind !== 'text' || !editorView) return;
-  const nextText = getCode();
+  let nextText = getCode();
+  if (!skipFormat && isPythonEntry(file)) {
+    try {
+      const formatted = await formattedTextForSave(file, nextText);
+      applyFormattedText(file, formatted); nextText = formatted;
+    } catch (error) {
+      renderSaveStatus('整形エラー');
+      unformattedSaveAction = () => saveCurrentFileWithOptions({ skipFormat:true });
+      finishWithError(error.message, error.pythonError, { allowUnformattedSave:true });
+      return;
+    }
+  }
   if (!isDirtyEntry(file) && nextText === file.text) { renderSaveStatus(); return; }
   const previous = { text:file.text, size:file.size, updatedAt:file.updatedAt };
   file.text = nextText; file.size = new Blob([nextText]).size; file.updatedAt = new Date().toISOString();
@@ -667,15 +794,31 @@ async function saveCurrentFile() {
   }
 }
 
-async function saveAllDirtyFiles() {
+async function saveAllDirtyFiles({ skipFormat = false } = {}) {
   const dirty = dirtyEntries();
   if (!dirty.length) { renderSaveStatus(); return; }
-  const previous = dirty.map(entry => ({ entry, text:entry.text, size:entry.size, updatedAt:entry.updatedAt }));
-  dirty.forEach(entry => { entry.text = draftBuffers.get(entry.id); entry.size = new Blob([entry.text]).size; entry.updatedAt = new Date().toISOString(); });
-  renderSaveStatus(`全${dirty.length}件を保存中…`);
+  const prepared = new Map();
+  if (!skipFormat) {
+    try {
+      for (const entry of dirty) prepared.set(entry.id, await formattedTextForSave(entry, draftBuffers.get(entry.id)));
+    } catch (error) {
+      const failing = dirty.find(entry => entry.path === error.pythonError?.filename);
+      if (failing && failing.id !== currentFileId) await selectFile(failing.id);
+      renderSaveStatus('整形エラー');
+      unformattedSaveAction = () => saveAllDirtyFiles({ skipFormat:true });
+      finishWithError(error.message, error.pythonError, { allowUnformattedSave:true });
+      return;
+    }
+    dirty.forEach(entry => applyFormattedText(entry, prepared.get(entry.id)));
+  }
+  const saving = dirty.filter(entry => isDirtyEntry(entry));
+  if (!saving.length) { renderSaveStatus(); renderFileList(); return; }
+  const previous = saving.map(entry => ({ entry, text:entry.text, size:entry.size, updatedAt:entry.updatedAt }));
+  saving.forEach(entry => { entry.text = draftBuffers.get(entry.id); entry.size = new Blob([entry.text]).size; entry.updatedAt = new Date().toISOString(); });
+  renderSaveStatus(`全${saving.length}件を保存中…`);
   try {
-    await saveEntries(dirty); dirty.forEach(entry => { draftBuffers.delete(entry.id); if (entryStatus(entry)) selectedChanges.add(entry.id); else selectedChanges.delete(entry.id); });
-    renderFileList(); renderGithubState(); addLog('system', `${dirty.length}件のファイルを保存しました。`);
+    await saveEntries(saving); saving.forEach(entry => { draftBuffers.delete(entry.id); if (entryStatus(entry)) selectedChanges.add(entry.id); else selectedChanges.delete(entry.id); });
+    renderFileList(); renderGithubState(); addLog('system', `${saving.length}件のファイルを保存しました。`);
   } catch (error) {
     previous.forEach(value => { value.entry.text = value.text; value.entry.size = value.size; value.entry.updatedAt = value.updatedAt; });
     renderSaveStatus('保存に失敗'); addLog('error', `全ファイルの保存に失敗しました: ${error.message}`);
@@ -697,6 +840,8 @@ function trackCurrentDraft() {
 
 async function selectFile(id) {
   if (id === currentFileId || !files.some(file => file.id === id)) return;
+  clearRuntimeError();
+  if (currentFileId && activeEntry()?.kind === 'text' && editorView) editorStates.set(currentFileId, editorView.state);
   currentFileId = id;
   const file = files.find(item => item.id === id);
   if (!file || file.kind === 'folder') return;
@@ -707,8 +852,10 @@ async function selectFile(id) {
   $('#binary-viewer').hidden = !['binary', 'submodule'].includes(file.kind);
   $('#binary-download').disabled = file.kind !== 'binary' || !file.blob;
   if (file.kind === 'text') {
-    suppressDraftTracking = true; setCode(currentEntryText(file)); suppressDraftTracking = false;
-    configureEditorForEntry(file); editorView.focus();
+    suppressDraftTracking = true;
+    editorView.setState(editorStates.get(file.id) || createEditorState(file, currentEntryText(file)));
+    configureEditorForEntry(file); editorStates.set(file.id, editorView.state);
+    suppressDraftTracking = false; editorView.focus();
   } else if (file.kind === 'image') {
     $('#asset-image').src = objectUrl(file.blob);
     $('#asset-name').textContent = file.path;
@@ -810,7 +957,7 @@ async function deleteFileDialog() {
   } else targets = files.filter(file => file.id === fileDialogTarget);
   const deletingActive = targets.some(file => file.id === currentFileId);
   for (const file of targets) {
-    draftBuffers.delete(file.id);
+    draftBuffers.delete(file.id); editorStates.delete(file.id);
     if (file.basePath) { file.deleted = true; selectedChanges.add(file.id); await saveEntry(file); }
     else { files = files.filter(item => item.id !== file.id); await removeEntry(file.id); }
   }
@@ -1031,6 +1178,32 @@ async function handleExplorerDrop(event, node = null) {
   catch (error) { setImportStatus(''); addLog('error', `ファイルを追加できません: ${error.message}`); }
 }
 
+function clipboardTimestampName(type = '') {
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+  const extension = type === 'image/jpeg' ? 'jpg' : type === 'image/webp' ? 'webp' : 'png';
+  return `clipboard-${stamp}.${extension}`;
+}
+
+function clipboardFiles(event) {
+  const items = [...(event.clipboardData?.items || [])];
+  const files = items.filter(item => item.kind === 'file').map(item => item.getAsFile()).filter(Boolean);
+  const fallback = files.length ? files : [...(event.clipboardData?.files || [])];
+  return fallback.map(file => {
+    if (file.name) return file;
+    return new File([file], clipboardTimestampName(file.type), { type:file.type || 'application/octet-stream', lastModified:file.lastModified || Date.now() });
+  });
+}
+
+function pasteClipboardFiles(event) {
+  const pasted = clipboardFiles(event);
+  if (!pasted.length || !currentProject) return false;
+  event.preventDefault();
+  const targetFolder = activeEntry() ? parentPath(activeEntry().path) : '';
+  setImportStatus(`${pasted.length}件のクリップボードファイルを追加中…`);
+  void importBrowserItems(pasted.map(file => ({ file, path:file.name || clipboardTimestampName(file.type) })), [], targetFolder);
+  return true;
+}
+
 function showEmptyProject() {
   refs.editor.hidden = true; $('#asset-viewer').hidden = true; $('#binary-viewer').hidden = false;
   $('#binary-meta').textContent = 'ファイルを作成してください。'; $('#active-file-name').textContent = 'ファイルなし';
@@ -1068,7 +1241,7 @@ async function confirmProjectDialog() {
 
 async function deleteCurrentProject() {
   if (!projectDeleteArmed) { projectDeleteArmed = true; $('#project-delete').textContent = dirtyEntries().length ? '未保存の編集も削除する' : 'もう一度押して削除'; return; }
-  const deletingId = currentProject.id; files.forEach(entry => draftBuffers.delete(entry.id)); await deleteProject(deletingId); projects = projects.filter(project => project.id !== deletingId);
+  const deletingId = currentProject.id; files.forEach(entry => { draftBuffers.delete(entry.id); editorStates.delete(entry.id); }); await deleteProject(deletingId); projects = projects.filter(project => project.id !== deletingId);
   if (!projects.length) {
     const replacement = createProject('新しいプロジェクト'); projects.push(replacement);
     await saveProjectRecord(replacement); await saveEntry(createEntry({ projectId:replacement.id, path:'main.py', kind:'text', text:'', order:0 }));
@@ -1079,30 +1252,7 @@ async function deleteCurrentProject() {
 async function initializeEditor() {
   editorView = new EditorView({
     parent: refs.editor,
-    state: EditorState.create({
-      doc: '',
-      extensions: [
-        lineNumbers(), highlightActiveLineGutter(), history(), foldGutter(), drawSelection(), highlightActiveLine(),
-        indentUnit.of('    '), languageCompartment.of([]), lintCompartment.of([]), bracketMatching(), closeBrackets(),
-        syntaxHighlighting(editorHighlight), indentGuides, gitDiffExtension,
-        autocompletion({ override:[pythonCompletionSource], activateOnTyping:true }),
-        keymap.of([
-          { key: 'Mod-Enter', run: () => { if (isPythonEntry(activeEntry())) void runCode(); return true; } },
-          indentWithTab, ...completionKeymap, ...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap
-        ]),
-        EditorView.updateListener.of(update => {
-          if (update.docChanged && activeEntry()?.kind === 'text') {
-            updateSyntaxStatus(update.view);
-            if (!suppressDraftTracking) trackCurrentDraft();
-            const cursor = update.state.selection.main.head;
-            if (isPythonEntry(activeEntry()) && !suppressDraftTracking && /[A-Za-z0-9_.]/.test(update.state.sliceDoc(Math.max(0, cursor - 1), cursor))) {
-              queueMicrotask(() => startCompletion(update.view));
-            }
-            renderGithubState();
-          }
-        })
-      ]
-    })
+    state:createEditorState(null, '')
   });
   try { projects = await listProjects(); } catch (error) { addLog('warning', `IndexedDBを利用できません: ${error.message}`); }
   if (!projects.length) {
@@ -1381,11 +1531,12 @@ function handleWorkerMessage(event) {
     updateLedUi(msg.colors);
   } else if (msg.type === 'result') {
     clearTimeout(executionTimer); executionTimer = null;
+    clearRuntimeError();
     drawFrame(new ImageData(new Uint8ClampedArray(msg.data), msg.width, msg.height));
     if (msg.gpio) Object.assign(gpioState, msg.gpio); if (msg.leds) updateLedUi(msg.leds);
     setRunning(false); setRuntime('実行完了', `${msg.width} × ${msg.height} の画像を出力しました`, 'success'); addLog('system', '実行が完了しました。');
   } else if (msg.type === 'error') {
-    finishWithError(formatPythonError(msg.message));
+    finishWithError(formatPythonError(msg.message), msg.error || parsePythonRuntimeError(msg.message, msg.stack));
   }
 }
 
@@ -1393,9 +1544,150 @@ function formatPythonError(message) {
   return String(message).replace('PythonError: ', '').replace(/File "([^"]+)", line (\d+)/g, '$1:$2');
 }
 
-function finishWithError(message) {
+function hideRuntimeErrorPanel() {
+  const panel = $('#editor-error');
+  if (panel) { panel.hidden = true; panel.replaceChildren(); }
+  unformattedSaveAction = null;
+}
+
+function clearRuntimeError() {
+  hideRuntimeErrorPanel();
+  if (!editorView) return;
+  editorView.dispatch({ effects:setRuntimeErrorEffect.of(null) });
+  if (isPythonEntry(activeEntry())) editorView.dispatch(setDiagnostics(editorView.state, syntaxDiagnostics(editorView)));
+}
+
+function errorRangeInEditor(error) {
+  if (!editorView || !error?.line) return null;
+  const state = editorView.state;
+  const lineNumber = Math.max(1, Math.min(Number(error.line), state.doc.lines));
+  const line = state.doc.line(lineNumber);
+  const from = error.column ? Math.min(line.to, line.from + Math.max(0, Number(error.column) - 1)) : line.from;
+  let to = line.to;
+  if (error.column) {
+    const endLineNumber = Math.max(lineNumber, Math.min(Number(error.endLine) || lineNumber, state.doc.lines));
+    const endLine = state.doc.line(endLineNumber);
+    to = Math.min(endLine.to, endLine.from + Math.max(Number(error.endColumn) - 1 || Number(error.column), 1));
+    if (to <= from) to = Math.min(state.doc.length, from + 1);
+  }
+  return { from, to, lineFrom:line.from, lineNumber };
+}
+
+let languageDetectorPromise = null;
+const translators = new Map();
+
+function translationPreference() { return localStorage.getItem('unitv-error-translation'); }
+function translationSupported() { return 'LanguageDetector' in globalThis && 'Translator' in globalThis; }
+
+async function createLanguageDetector(onProgress, userInitiated) {
+  const availability = await globalThis.LanguageDetector.availability();
+  if (availability === 'unavailable') throw new Error('このChromeでは言語判定モデルを利用できません。');
+  if ((availability === 'downloadable' || availability === 'downloading') && !userInitiated) {
+    const error = new Error('翻訳モデルの初回準備にはボタン操作が必要です。'); error.needsUserActivation = true; throw error;
+  }
+  if (!languageDetectorPromise) {
+    languageDetectorPromise = globalThis.LanguageDetector.create({ monitor(monitor) {
+      monitor.addEventListener('downloadprogress', event => onProgress?.(event.loaded));
+    } }).catch(error => { languageDetectorPromise = null; throw error; });
+  }
+  return languageDetectorPromise;
+}
+
+async function createTranslator(sourceLanguage, onProgress, userInitiated) {
+  const key = `${sourceLanguage}:ja`;
+  if (translators.has(key)) return translators.get(key);
+  const availability = await globalThis.Translator.availability({ sourceLanguage, targetLanguage:'ja' });
+  if (availability === 'unavailable') throw new Error(`${sourceLanguage}から日本語への翻訳モデルを利用できません。`);
+  if ((availability === 'downloadable' || availability === 'downloading') && !userInitiated) {
+    const error = new Error('翻訳モデルの初回準備にはボタン操作が必要です。'); error.needsUserActivation = true; throw error;
+  }
+  const promise = globalThis.Translator.create({ sourceLanguage, targetLanguage:'ja', monitor(monitor) {
+    monitor.addEventListener('downloadprogress', event => onProgress?.(event.loaded));
+  } }).catch(error => { translators.delete(key); throw error; });
+  translators.set(key, promise); return promise;
+}
+
+async function translateErrorReason(error, output, status, { userInitiated = false } = {}) {
+  if (!translationSupported()) { status.textContent = '内蔵翻訳はデスクトップ版Chrome 138以降で利用できます。'; return; }
+  if (!error?.reason || /[ぁ-んァ-ヶ一-龠]/.test(error.reason)) { status.textContent = 'エラー理由はすでに日本語です。'; return; }
+  const progress = loaded => { status.textContent = `翻訳モデルを準備中… ${Math.round(loaded * 100)}%`; };
+  try {
+    status.textContent = 'エラーの言語を判定中…';
+    const detector = await createLanguageDetector(progress, userInitiated);
+    const detected = await detector.detect(`${error.type}: ${error.reason}`);
+    const best = detected?.[0];
+    if (best?.detectedLanguage === 'ja') { status.textContent = 'エラー理由はすでに日本語です。'; return; }
+    const sourceLanguage = best?.confidence >= 0.35 ? best.detectedLanguage : (/^[\x00-\x7f\s]+$/.test(error.reason) ? 'en' : best?.detectedLanguage);
+    if (!sourceLanguage || sourceLanguage === 'und') throw new Error('エラーの言語を判定できませんでした。');
+    status.textContent = '日本語へ翻訳中…';
+    const translator = await createTranslator(sourceLanguage, progress, userInitiated);
+    output.textContent = await translator.translate(error.reason);
+    output.hidden = false; status.textContent = `Chrome内蔵翻訳（${sourceLanguage} → ja）`;
+  } catch (translationError) {
+    status.textContent = translationError.message;
+    if (translationError.needsUserActivation) {
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = '翻訳モデルを準備';
+      button.addEventListener('click', () => { button.remove(); void translateErrorReason(error, output, status, { userInitiated:true }); });
+      status.after(button);
+    }
+  }
+}
+
+function renderRuntimeErrorPanel(error, options = {}) {
+  const panel = $('#editor-error'); const explanation = explainPythonError(error);
+  panel.replaceChildren(); panel.hidden = false;
+  const head = document.createElement('div'); head.className = 'editor-error-head';
+  const title = document.createElement('strong'); title.textContent = `${error.type || 'Error'} · ${explanation.title}`;
+  const location = document.createElement('span'); location.textContent = error.filename && error.line ? `${error.filename}:${error.line}${error.column ? `:${error.column}` : ''}` : '位置情報なし';
+  head.append(title, location);
+  const description = document.createElement('p'); description.textContent = explanation.description;
+  const translation = document.createElement('p'); translation.className = 'editor-error-translation'; translation.hidden = true;
+  const translationStatus = document.createElement('small'); translationStatus.className = 'editor-error-translation-status';
+  const actions = document.createElement('div'); actions.className = 'editor-error-actions';
+  const preference = translationPreference();
+  if (translationSupported() && preference === null) {
+    translationStatus.textContent = '英語のエラー理由をChrome内蔵AIで日本語化できます。';
+    const enable = document.createElement('button'); enable.type = 'button'; enable.textContent = '自動翻訳を有効化';
+    const disable = document.createElement('button'); disable.type = 'button'; disable.textContent = '使用しない';
+    enable.addEventListener('click', () => { localStorage.setItem('unitv-error-translation', 'enabled'); actions.replaceChildren(); void translateErrorReason(error, translation, translationStatus, { userInitiated:true }); });
+    disable.addEventListener('click', () => { localStorage.setItem('unitv-error-translation', 'disabled'); actions.replaceChildren(); translationStatus.textContent = '自動翻訳は無効です。'; });
+    actions.append(enable, disable);
+  } else if (preference === 'enabled') {
+    const disable = document.createElement('button'); disable.type = 'button'; disable.textContent = '自動翻訳を無効化';
+    disable.addEventListener('click', () => { localStorage.setItem('unitv-error-translation', 'disabled'); disable.remove(); translationStatus.textContent = '自動翻訳は無効です。'; });
+    actions.append(disable); void translateErrorReason(error, translation, translationStatus);
+  } else if (translationSupported()) {
+    translationStatus.textContent = '自動翻訳は無効です。';
+    const enable = document.createElement('button'); enable.type = 'button'; enable.textContent = '翻訳を有効化';
+    enable.addEventListener('click', () => { localStorage.setItem('unitv-error-translation', 'enabled'); enable.remove(); void translateErrorReason(error, translation, translationStatus, { userInitiated:true }); });
+    actions.append(enable);
+  }
+  if (options.allowUnformattedSave) {
+    const save = document.createElement('button'); save.type = 'button'; save.className = 'danger'; save.textContent = '整形せず保存';
+    save.addEventListener('click', () => { const action = unformattedSaveAction; hideRuntimeErrorPanel(); void action?.(); }); actions.prepend(save);
+  }
+  const details = document.createElement('details'); const summary = document.createElement('summary'); summary.textContent = '元のエラーを表示';
+  const pre = document.createElement('pre'); pre.textContent = error.rawMessage || error.reason || '';
+  details.append(summary, pre); panel.append(head, description, translation, translationStatus, actions, details);
+}
+
+async function presentRuntimeError(error, options = {}) {
+  if (!error) return;
+  const target = error.filename ? visibleFiles().find(file => file.kind === 'text' && (file.path === error.filename || error.filename.endsWith(`/${file.path}`))) : activeEntry();
+  if (target && target.id !== currentFileId) await selectFile(target.id);
+  const range = errorRangeInEditor(error);
+  if (range && target?.id === currentFileId) {
+    editorView.dispatch({ effects:setRuntimeErrorEffect.of(range), selection:{ anchor:range.from }, scrollIntoView:true });
+    editorView.dispatch(setDiagnostics(editorView.state, [{ from:range.from, to:Math.max(range.from + 1, range.to), severity:'error', message:`${error.type}: ${explainPythonError(error).description}` }]));
+    editorView.focus();
+  }
+  renderRuntimeErrorPanel(error, options);
+}
+
+function finishWithError(message, error = null, options = {}) {
   clearTimeout(executionTimer); executionTimer = null; setRunning(false); setRuntime('エラー', 'シリアルモニタを確認してください', 'error');
   addLog('error', message);
+  if (error) void presentRuntimeError(error, options);
 }
 
 function flushRealStdout(final = false) {
@@ -1567,6 +1859,7 @@ async function stopExecution(reason = '手動で実行を停止しました。')
 
 async function runCode() {
   if (running) return;
+  clearRuntimeError();
   const activeFile = activeEntry();
   if (!isPythonEntry(activeFile)) { finishWithError('実行するPythonファイルを選択してください。'); return; }
   if (syntaxDiagnostics(editorView).length) { finishWithError('Pythonコードに書式エラーがあります。エディター内の赤い印を確認してください。'); editorView.focus(); return; }
@@ -2045,6 +2338,7 @@ async function pullFromGithub() {
     const entries = snapshot.entries.map(item => createEntry({ projectId:currentProject.id, ...item }));
     currentProject.source = { ...currentProject.source, headSha:snapshot.headSha, treeSha:snapshot.treeSha, lastSyncAt:new Date().toISOString(), pendingCommit:null };
     currentProject.activePath = entries.some(entry => entry.path === currentProject.activePath) ? currentProject.activePath : entries.find(entry => entry.kind === 'text')?.path || entries[0]?.path || '';
+    files.forEach(entry => editorStates.delete(entry.id));
     await replaceProjectEntries(currentProject.id, entries); await saveProjectRecord(currentProject);
     files = entries; currentFileId = null; selectedChanges.clear(); const next = entries.find(entry => entry.path === currentProject.activePath) || entries[0];
     if (next) await selectFile(next.id); else showEmptyProject();
@@ -2206,6 +2500,7 @@ $('#project-new').addEventListener('click', () => openProjectDialog('new')); $('
 $('#project-confirm').addEventListener('click', confirmProjectDialog); $('#project-delete').addEventListener('click', deleteCurrentProject);
 $('#project-name-input').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); void confirmProjectDialog(); } });
 $('#editor-fullscreen').addEventListener('click', toggleEditorFullscreen); $('#diff-open').addEventListener('click', openDiffDialog);
+$('#editor-search').addEventListener('click', () => { if (editorView) { openSearchPanel(editorView); editorView.focus(); } });
 $('#diff-select-all').addEventListener('click', () => { const changes = changedEntries(); const allSelected = changes.every(entry => selectedChanges.has(entry.id)); changes.forEach(entry => allSelected ? selectedChanges.delete(entry.id) : selectedChanges.add(entry.id)); renderDiffList(); });
 $('#diff-dialog').addEventListener('close', destroyMergeView);
 $('#asset-to-frame').addEventListener('click', () => { const entry = activeEntry(); if (!entry?.blob) return; imageLoadPromise = loadImageFile(new File([entry.blob], entry.path, { type:entry.mime || entry.blob.type })).catch(error => finishWithError(error.message)).finally(() => { imageLoadPromise = null; }); });
@@ -2215,9 +2510,12 @@ fileList.addEventListener('contextmenu', event => {
   if (event.target.closest('.file-row')) return;
   event.preventDefault(); showFileContextMenu(event.clientX, event.clientY, null);
 });
-fileList.addEventListener('dragover', event => { event.preventDefault(); event.dataTransfer.dropEffect = draggedExplorerNode ? 'move' : 'copy'; fileList.classList.add('drop-root'); });
+fileList.addEventListener('dragover', event => { event.preventDefault(); event.dataTransfer.dropEffect = draggedExplorerNode ? 'move' : 'copy'; markExplorerDropTarget(); });
 fileList.addEventListener('dragleave', event => { if (!fileList.contains(event.relatedTarget)) fileList.classList.remove('drop-root'); });
-fileList.addEventListener('drop', event => { event.preventDefault(); fileList.classList.remove('drop-root'); void handleExplorerDrop(event, null); });
+fileList.addEventListener('drop', event => {
+  event.preventDefault(); clearExplorerDragState();
+  void handleExplorerDrop(event, null).finally(() => clearExplorerDragState(true));
+});
 $('#file-import-status button').addEventListener('click', () => { importCancelled = true; setImportStatus('中止しています…'); });
 $('#file-upload').addEventListener('change', event => {
   const input = event.currentTarget; const items = [...input.files].map(file => ({ file, path:file.name })); input.value = '';
@@ -2290,6 +2588,11 @@ $('#project-open').addEventListener('click',()=>{ try { assertProjectSaved('プ�
 document.querySelectorAll('dialog').forEach(dialog => dialog.addEventListener('click', event => { if(event.target===dialog)dialog.close(); }));
 document.addEventListener('pointerdown', event => { if (!event.target.closest('#file-context-menu') && !event.target.closest('.file-menu')) hideFileContextMenu(); });
 document.addEventListener('scroll', hideFileContextMenu, true);
+document.addEventListener('paste', pasteClipboardFiles);
+document.addEventListener('dragend', () => clearExplorerDragState(true), true);
+document.addEventListener('drop', () => queueMicrotask(() => clearExplorerDragState(true)), true);
+document.addEventListener('dragleave', event => { if (!event.relatedTarget) clearExplorerDragState(); }, true);
+window.addEventListener('blur', () => clearExplorerDragState(true));
 document.addEventListener('keydown', event => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault(); void (event.shiftKey ? saveAllDirtyFiles() : saveCurrentFile()); return;
@@ -2298,6 +2601,7 @@ document.addEventListener('keydown', event => {
     event.preventDefault(); const row = document.activeElement.closest('.file-row'); const rect = row.getBoundingClientRect();
     const entry = visibleFiles().find(item => item.path === row.dataset.path); showFileContextMenu(rect.left + 24, rect.top + 24, { type:row.dataset.type, path:row.dataset.path, file:entry }); return;
   }
+  if (event.key === 'Escape') clearExplorerDragState(true);
   if (event.key === 'Escape' && !$('#file-context-menu').hidden) { hideFileContextMenu(); return; }
   if (event.key === 'Escape' && document.querySelector('.code-panel')?.classList.contains('editor-fullscreen')) toggleEditorFullscreen();
 });

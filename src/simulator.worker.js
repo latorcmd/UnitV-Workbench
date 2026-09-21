@@ -1,3 +1,5 @@
+import { mapPreparedError, parsePythonRuntimeError, prepareUnitVCode } from './python-runtime-errors.js';
+
 const FRAME_SIZES = {
   QQVGA: [160, 120], QVGA: [320, 240], VGA: [640, 480],
   QQQVGA: [80, 60], B64X64: [64, 64], B128X128: [128, 128], LCD: [320, 240]
@@ -21,6 +23,7 @@ let pyodide = null;
 let liveCameraMode = false;
 let cameraRequestSequence = 0;
 const cameraFrameRequests = new Map();
+let pythonOutputBuffer = [];
 
 const clamp = (n, min = 0, max = 255) => Math.max(min, Math.min(max, Number(n) || 0));
 const post = (type, payload = {}) => self.postMessage({ type, ...payload });
@@ -359,7 +362,11 @@ function buildBridge() {
     drawRectangle: (img,r,c,t,f) => img.drawRectangle(r,c,t,f), drawLine: (img,l,c,t) => img.drawLine(l,c,t),
     drawCircle: (img,x,y,r,c,t,f) => img.drawCircle(x,y,r,c,t,f), drawCross: (img,x,y,c,s,t) => img.drawCross(x,y,c,s,t),
     drawString: (img,x,y,s,c,scale) => img.drawString(x,y,s,c,scale),
-    log: (...args) => post('log', { level:'stdout', text: args.map(String).join(' '), time: stamp() }),
+    log: (...args) => {
+      const text = args.map(String).join(' ');
+      pythonOutputBuffer.push(text); if (pythonOutputBuffer.length > 120) pythonOutputBuffer.shift();
+      post('log', { level:'stdout', text, time:stamp() });
+    },
     uartWrite: value => { const raw=toJs(value); const bytes=typeof raw==='string' ? new TextEncoder().encode(raw) : Uint8Array.from(raw); post('log',{level:'uart',text:new TextDecoder().decode(bytes),bytes:Array.from(bytes),time:stamp()}); return bytes.length; },
     uartAny: () => uartQueue.length,
     uartRead: n => { const count=n==null||Number(n)<0?uartQueue.length:Math.min(Number(n),uartQueue.length); return Uint8Array.from(uartQueue.splice(0,count)); },
@@ -536,16 +543,6 @@ async function ensurePython() {
   return pyodide;
 }
 
-function prepareCode(code, cameraMode = false) {
-  if (cameraMode) {
-    const prepared = String(code).replace(/\bsensor\s*\.\s*snapshot\s*\(\s*\)/g, 'await sensor.snapshot_async()');
-    return { prepared, limited:false };
-  }
-  let limited = false;
-  const prepared = String(code).replace(/^while\s*\(?\s*True\s*\)?\s*:/gm, () => { limited = true; return 'for __unitv_browser_frame in range(1):'; });
-  return { prepared, limited };
-}
-
 self.onmessage = async event => {
   const payload = event.data;
   if (payload?.type === 'camera-frame') {
@@ -559,7 +556,9 @@ self.onmessage = async event => {
     cameraFrameRequests.delete(payload.requestId); pending.reject(new Error(payload.message || 'カメラフレームを取得できませんでした。')); return;
   }
   if (payload?.type !== 'run') return;
+  let sourceMappings = [];
   try {
+    pythonOutputBuffer = [];
     liveCameraMode = Boolean(payload.cameraMode);
     sourceFrame = { width: payload.image.width, height: payload.image.height, data: new Uint8ClampedArray(payload.image.data) };
     latestFrame = cloneFrame(sourceFrame); targetSize = FRAME_SIZES.QVGA; windowing=null; hmirror=false; vflip=false; brightness=0; saturation=0; contrast=0; registers={};
@@ -582,7 +581,8 @@ self.onmessage = async event => {
     const entryDirectory = String(payload.filename || '').replace(/\\/g, '/').includes('/') ? String(payload.filename).replace(/\\/g, '/').slice(0, String(payload.filename).replace(/\\/g, '/').lastIndexOf('/')) : '';
     await runtime.runPythonAsync(`import os, sys, importlib\nos.chdir(${JSON.stringify(workspace)})\nsys.path.insert(0, ${JSON.stringify(workspace)})\nsys.path.insert(0, ${JSON.stringify(`${workspace}/${entryDirectory}`)})\nimportlib.invalidate_caches()`);
     post('status', { phase: 'executing', text: liveCameraMode ? 'カメラフレームを連続処理しています' : 'コードを実行しています', liveCamera:liveCameraMode });
-    const { prepared, limited } = prepareCode(payload.code, liveCameraMode);
+    const { prepared, limited, mappings } = prepareUnitVCode(payload.code, liveCameraMode);
+    sourceMappings = mappings;
     if (limited) post('log',{level:'system',text:'固定画像モードのため while(True) を1フレームだけ実行します。',time:stamp()});
     if (liveCameraMode) post('log',{level:'system',text:'カメラモード: while(True) を維持し、sensor.snapshot() ごとに新しいフレームを取得します。停止ボタンで終了できます。',time:stamp()});
     await runtime.runPythonAsync(prepared, { filename: payload.filename || 'main.py' });
@@ -593,6 +593,10 @@ self.onmessage = async event => {
     liveCameraMode = false;
     const message = String(error?.message || error);
     const stack = String(error?.stack || '');
-    post('error', { message: message === 'PythonError' && stack ? stack : message, stack });
+    const capturedOutput = pythonOutputBuffer.join('\n');
+    const diagnosticSource = capturedOutput.includes('Traceback') ? capturedOutput : (message === 'PythonError' && stack ? stack : message);
+    let details = parsePythonRuntimeError(diagnosticSource, stack);
+    if (details.filename === String(payload.filename || '').replace(/\\/g, '/')) details = mapPreparedError(details, sourceMappings);
+    post('error', { message:`${details.type}: ${details.reason}`, stack, error:details });
   }
 };
