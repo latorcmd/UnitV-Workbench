@@ -31,7 +31,8 @@ const MAX_TEXT_BYTES = 1024 * 1024;
 const EXECUTION_LIMIT_MS = 8000;
 const KMODEL_EXECUTION_LIMIT_MS = 60000;
 const APP_NAME = 'UnitV Workbench';
-const APP_VERSION = '0.4.1';
+const APP_VERSION = '0.4.2';
+const SOURCE_REPOSITORY_URL = 'https://github.com/latorcmd/UnitV-Workbench';
 const initialTheme = localStorage.getItem('unitv-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
 document.documentElement.dataset.theme = initialTheme;
 
@@ -50,7 +51,8 @@ document.querySelector('#app').innerHTML = /*html*/ `
         <button class="icon-button" id="theme-toggle" type="button" aria-label="ライトモードに切り替え" title="表示テーマ">☀</button>
         <button class="ghost-button" id="api-open" type="button">API一覧</button>
         <button class="ghost-button" id="license-open" type="button">ライセンス</button>
-        <button class="ghost-button" id="github-open" type="button">GitHub</button>
+        <a class="ghost-button" href="${SOURCE_REPOSITORY_URL}" target="_blank" rel="noreferrer" title="GitHubでソースコードを見る">GitHub Repo ↗</a>
+        <button class="ghost-button" id="github-open" type="button">GitHub連携</button>
         <button class="ghost-button" id="project-open" type="button">読込</button>
         <button class="ghost-button" id="project-save" type="button">書出</button>
         <a class="ghost-button download-link" href="/unitv-workbench-offline.zip" download>オフライン版</a>
@@ -165,6 +167,7 @@ document.querySelector('#app').innerHTML = /*html*/ `
   <dialog id="license-dialog" class="dialog license-dialog">
     <form method="dialog"><div class="dialog-head"><div><span class="panel-kicker">OPEN SOURCE</span><h2>ライセンス</h2></div><button value="close" aria-label="閉じる">×</button></div>
       <p class="dialog-intro"><strong>${APP_NAME} v${APP_VERSION}</strong> の自作部分はMIT Licenseで公開します。ブラウザへ同梱している主なOSSは次のとおりです。完全な一覧と表記はリポジトリの <code>LICENSE</code> と <code>THIRD_PARTY_NOTICES.md</code> にあります。</p>
+      <p class="license-note">ソースコード: <a href="${SOURCE_REPOSITORY_URL}" target="_blank" rel="noreferrer">github.com/latorcmd/UnitV-Workbench ↗</a></p>
       <div class="license-list">
         <a href="https://github.com/pyodide/pyodide" target="_blank" rel="noreferrer"><strong>Pyodide 0.28.3</strong><span>Mozilla Public License 2.0</span></a>
         <a href="https://github.com/astral-sh/ruff" target="_blank" rel="noreferrer"><strong>Ruff WASM 0.16.1</strong><span>MIT License</span></a>

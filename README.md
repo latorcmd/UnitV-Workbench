@@ -1,6 +1,6 @@
 # UnitV Workbench
 
-Current version: **0.4.1**
+Current version: **0.4.2**
 
 UnitV向けPythonコードを、画像または端末カメラを入力としてブラウザ内で編集・検証し、実機でも実行できる開発ワークベンチです。画像・コード・UARTデータ・ローカルプロジェクトはサーバーへ保存しません。
 
