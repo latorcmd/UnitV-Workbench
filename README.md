@@ -70,30 +70,6 @@ KPUランタイムをソースから再生成する場合はClangを導入し、
 
 GitHub App `unitv-browser-lab`を使用します。Device Flowを有効にし、Repository permissionsでContentsをRead and write、MetadataをRead-onlyに設定します。公開Workerには32文字以上の`SESSION_SECRET`を秘密の環境変数として設定します。アクセストークンは暗号化したHttpOnly Cookie内に保持され、ブラウザのJavaScriptやlocalStorageへ公開しません。
 
-## GitHubへパブリック公開する
-
-このリポジトリには実行時の秘密情報を含めません。GitHub AppのClient IDは公開情報です。`SESSION_SECRET`、GitHubアクセストークン、秘密鍵はコミットせず、公開先のSecret／環境変数にだけ設定してください。`.codex-remote-attachments/`、ビルド成果物、依存パッケージ、ローカルキャッシュは`.gitignore`で除外しています。
-
-1. GitHubの「New repository」で空のリポジトリを作り、Visibilityを`Public`にします。既存履歴と衝突しないよう、README・LICENSE・`.gitignore`の自動作成は選択しません。
-2. PowerShellでこのプロジェクトのルートへ移動し、次を実行します。`YOUR_NAME`と`REPOSITORY`は作成したリポジトリに置き換えてください。
-
-   ```powershell
-   git status
-   git remote add origin https://github.com/YOUR_NAME/REPOSITORY.git
-   git branch -M main
-   git push -u origin main
-   ```
-
-3. `origin`が既に存在する場合は、`git remote add`の代わりに次を実行します。このプロジェクトのSites用remoteは`sites`という別名なので、そのまま残せます。
-
-   ```powershell
-   git remote set-url origin https://github.com/YOUR_NAME/REPOSITORY.git
-   ```
-
-4. GitHubのリポジトリ画面で、`LICENSE`、`THIRD_PARTY_NOTICES.md`、README、ソースコードだけが公開され、`.codex-remote-attachments`や秘密情報が含まれていないことを確認します。
-
-GitHub Pagesは静的なシミュレーター部分だけなら利用できますが、現在のビルドはサイト直下での配信を前提にしています。また、GitHubログイン／プッシュ機能には`worker/github-worker.js`を動かすHTTPSバックエンドと`SESSION_SECRET`が必要なため、GitHub PagesだけではGitHub連携は動作しません。
-
 ## ライセンス
 
 UnitV Workbenchの自作部分は[MIT License](LICENSE)で公開します。利用しているOSSとそのライセンスは[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)にまとめています。アプリ画面右上の「ライセンス」からも主要な同梱OSSを確認できます。
