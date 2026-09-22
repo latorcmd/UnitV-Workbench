@@ -31,14 +31,11 @@ ZeroDivisionError: division by zero`;
   assert.equal(error.type, 'ZeroDivisionError');
 });
 
-test('maps camera replacement columns back to original source', () => {
-  const source = 'value = sensor.snapshot() + missing';
+test('keeps synchronous snapshot calls usable inside functions in camera mode', () => {
+  const source = 'def capture():\n    return sensor.snapshot()\nwhile(1):\n    capture()';
   const transformed = prepareUnitVCode(source, true);
-  assert.equal(transformed.prepared, 'value = await sensor.snapshot_async() + missing');
-  const preparedColumn = transformed.prepared.indexOf('missing') + 1;
-  const mapped = mapPreparedError({ line:1, column:preparedColumn, endColumn:preparedColumn + 7 }, transformed.mappings);
-  assert.equal(mapped.column, source.indexOf('missing') + 1);
-  assert.equal(mapped.endColumn, source.indexOf('missing') + 8);
+  assert.match(transformed.prepared, /return sensor\.snapshot\(\)/);
+  assert.match(transformed.prepared, /while await bridge\.loopCondition\(\):/);
 });
 
 test('limits only top-level while True in static-image mode', () => {
@@ -47,6 +44,12 @@ test('limits only top-level while True in static-image mode', () => {
   assert.equal(transformed.limited, true);
   assert.match(transformed.prepared, /^for __unitv_browser_frame in range\(1\):/);
   assert.match(transformed.prepared, /\n    while True:/);
+});
+
+test('also limits UnitV-style while(1) in static-image mode', () => {
+  const transformed = prepareUnitVCode('while(1):\n    print(1)', false);
+  assert.equal(transformed.limited, true);
+  assert.match(transformed.prepared, /^for __unitv_browser_frame in range\(1\):/);
 });
 
 test('converts UTF-8 formatter byte ranges to line and UTF-16 column', () => {

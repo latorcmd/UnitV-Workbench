@@ -1,12 +1,13 @@
 {
   "name": "unitv-browser-lab",
-  "version": "0.3.31",
+  "version": "0.4.0",
   "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --configLoader runner",
     "test": "node --test tests/*.test.js",
+    "build:kpu": "powershell -ExecutionPolicy Bypass -File scripts/build-kmodel-runtime.ps1",
     "prepare-runtime": "node scripts/copy-runtime.mjs",
     "build": "node scripts/clean-dist.mjs && npm run prepare-runtime && vite build --configLoader runner && node scripts/copy-worker.mjs && node scripts/cleanup-runtime.mjs && node scripts/copy-offline-package.mjs",
     "preview": "vite preview --host 0.0.0.0 --configLoader runner"

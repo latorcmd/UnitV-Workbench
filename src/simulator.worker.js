@@ -1,4 +1,5 @@
 import { mapPreparedError, parsePythonRuntimeError, prepareUnitVCode } from './python-runtime-errors.js';
+import { KmodelManager } from './kmodel-runtime.js';
 
 const FRAME_SIZES = {
   QQVGA: [160, 120], QVGA: [320, 240], VGA: [640, 480],
@@ -18,7 +19,7 @@ let registers = {};
 let uartQueue = [];
 let gpio = {};
 let ledState = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
-let inference = null;
+let kmodelManager = null;
 let pyodide = null;
 let liveCameraMode = false;
 let cameraRequestSequence = 0;
@@ -142,6 +143,12 @@ function matchesThreshold(r, g, b, thresholds) {
   return false;
 }
 
+function thresholdCode(r, g, b, thresholds) {
+  let code = 0;
+  thresholds.forEach((threshold, index) => { if (matchesThreshold(r, g, b, [threshold])) code |= (1 << index); });
+  return code;
+}
+
 function setPixel(frame, x, y, c) {
   x = Math.round(x); y = Math.round(y);
   if (x < 0 || y < 0 || x >= frame.width || y >= frame.height) return;
@@ -222,30 +229,31 @@ class RawImage {
     const x0 = Math.max(0, r[0] | 0), y0 = Math.max(0, r[1] | 0);
     const x1 = Math.min(this.frame.width, x0 + (r[2] | 0)), y1 = Math.min(this.frame.height, y0 + (r[3] | 0));
     const width = x1 - x0, height = y1 - y0;
-    const mask = new Uint8Array(width * height), seen = new Uint8Array(width * height);
+    const mask = new Uint32Array(width * height), seen = new Uint8Array(width * height);
     for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
       const pi = ((y + y0) * this.frame.width + x + x0) * 4;
-      let ok = matchesThreshold(this.frame.data[pi], this.frame.data[pi + 1], this.frame.data[pi + 2], ts);
-      if (invert) ok = !ok; mask[y * width + x] = ok ? 1 : 0;
+      let code = thresholdCode(this.frame.data[pi], this.frame.data[pi + 1], this.frame.data[pi + 2], ts);
+      if (invert) code = code ? 0 : 1; mask[y * width + x] = code;
     }
     const blobs = [];
     for (let sy = 0; sy < height; sy += Math.max(1, Number(yStride))) for (let sx = 0; sx < width; sx += Math.max(1, Number(xStride))) {
       const seed = sy * width + sx; if (!mask[seed] || seen[seed]) continue;
       const qx = [sx], qy = [sy]; seen[seed] = 1;
+      const componentCode = mask[seed];
       let head = 0, count = 0, minX = sx, maxX = sx, minY = sy, maxY = sy, sumX = 0, sumY = 0;
       while (head < qx.length) {
         const x = qx[head], y = qy[head++]; count++; sumX += x; sumY += y;
         minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y);
         for (const [nx, ny] of [[x-1,y],[x+1,y],[x,y-1],[x,y+1]]) {
           if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-          const ni = ny * width + nx; if (mask[ni] && !seen[ni]) { seen[ni] = 1; qx.push(nx); qy.push(ny); }
+          const ni = ny * width + nx; if (mask[ni] === componentCode && !seen[ni]) { seen[ni] = 1; qx.push(nx); qy.push(ny); }
         }
       }
       const bw = maxX - minX + 1, bh = maxY - minY + 1;
       if (count >= Number(pixelsThreshold) && bw * bh >= Number(areaThreshold)) blobs.push({
         x: minX + x0, y: minY + y0, w: bw, h: bh, pixels: count,
         cx: Math.round(sumX / count) + x0, cy: Math.round(sumY / count) + y0,
-        density: count / (bw * bh), rotation: 0, code: 1
+        density: count / (bw * bh), rotation: 0, code:componentCode
       });
     }
     if (merge && blobs.length > 1) {
@@ -254,7 +262,7 @@ class RawImage {
         const hit = merged.find(m => b.x <= m.x+m.w+margin && b.x+b.w+margin >= m.x && b.y <= m.y+m.h+margin && b.y+b.h+margin >= m.y);
         if (!hit) merged.push({...b}); else {
           const nx = Math.min(hit.x,b.x), ny=Math.min(hit.y,b.y), nx2=Math.max(hit.x+hit.w,b.x+b.w), ny2=Math.max(hit.y+hit.h,b.y+b.h);
-          hit.pixels += b.pixels; hit.x=nx; hit.y=ny; hit.w=nx2-nx; hit.h=ny2-ny; hit.cx=Math.round(nx+hit.w/2); hit.cy=Math.round(ny+hit.h/2); hit.density=hit.pixels/(hit.w*hit.h);
+          hit.pixels += b.pixels; hit.code |= b.code; hit.x=nx; hit.y=ny; hit.w=nx2-nx; hit.h=ny2-ny; hit.cx=Math.round(nx+hit.w/2); hit.cy=Math.round(ny+hit.h/2); hit.density=hit.pixels/(hit.w*hit.h);
         }
       }
       return merged;
@@ -268,81 +276,28 @@ class RawImage {
   drawString(x, y, text, color, scale = 1) { canvasDrawText(this.frame,x,y,text,colorTuple(color),scale); return this; }
 }
 
-function softmax(values) {
-  const max = Math.max(...values); const exps = values.map(v => Math.exp(v - max)); const sum = exps.reduce((a,b)=>a+b,0) || 1;
-  return exps.map(v => v / sum);
-}
-
-function nms(items, threshold = .45) {
-  const out = [];
-  for (const item of [...items].sort((a,b)=>b.score-a.score)) {
-    if (out.some(o => {
-      const x1=Math.max(o.x1,item.x1), y1=Math.max(o.y1,item.y1), x2=Math.min(o.x2,item.x2), y2=Math.min(o.y2,item.y2);
-      const inter=Math.max(0,x2-x1)*Math.max(0,y2-y1); const union=(o.x2-o.x1)*(o.y2-o.y1)+(item.x2-item.x1)*(item.y2-item.y1)-inter;
-      return union > 0 && inter/union > threshold;
-    })) continue;
-    out.push(item);
-  }
-  return out;
-}
-
-async function runInference(modelBuffer, config) {
-  if (!modelBuffer) return null;
-  const cfg = config || {};
-  const [iw, ih] = cfg.inputSize || [224, 224];
-  const resized = resizeFrame(sourceFrame, iw, ih);
-  const layout = String(cfg.layout || 'NCHW').toUpperCase();
-  const dtype = String(cfg.inputType || 'float32').toLowerCase();
-  const channels = 3;
-  const input = dtype === 'uint8' ? new Uint8Array(iw*ih*channels) : new Float32Array(iw*ih*channels);
-  const scale = cfg.normalize?.scale ?? (dtype === 'uint8' ? 1 : 1/255);
-  const mean = cfg.normalize?.mean || [0,0,0], std = cfg.normalize?.std || [1,1,1];
-  for (let y=0;y<ih;y++) for (let x=0;x<iw;x++) for (let c=0;c<3;c++) {
-    const value = (resized.data[(y*iw+x)*4+c] * scale - (mean[c] ?? 0)) / (std[c] ?? 1);
-    const index = layout === 'NHWC' ? (y*iw+x)*3+c : c*iw*ih+y*iw+x;
-    input[index] = value;
-  }
-  ort.env.wasm.numThreads = 1;
-  ort.env.wasm.wasmPaths = new URL('/ort/', self.location.href).href;
-  const session = await ort.InferenceSession.create(modelBuffer, { executionProviders: ['wasm'] });
-  const dims = layout === 'NHWC' ? [1,ih,iw,3] : [1,3,ih,iw];
-  const tensor = new ort.Tensor(dtype === 'uint8' ? 'uint8' : 'float32', input, dims);
-  const results = await session.run({ [session.inputNames[0]]: tensor });
-  const outputName = cfg.outputName && results[cfg.outputName] ? cfg.outputName : session.outputNames[0];
-  const output = results[outputName];
-  const flat = Array.from(output.data, Number);
-  if ((cfg.task || 'classification') === 'classification') {
-    const values = cfg.applySoftmax === false ? flat : softmax(flat);
-    return { task: 'classification', values, classes: cfg.classes || [] };
-  }
-  const conf = Number(cfg.confidenceThreshold ?? .5), nmsThreshold = Number(cfg.nmsThreshold ?? .45);
-  let rows = [];
-  const dimsOut = output.dims;
-  if (dimsOut.at(-1) === 6) {
-    for (let i=0;i<flat.length;i+=6) rows.push(flat.slice(i,i+6));
-    rows = rows.filter(r=>r[4]>=conf).map(r=>({x1:r[0],y1:r[1],x2:r[2],y2:r[3],score:r[4],classId:Math.round(r[5])}));
-  } else {
-    const classCount = (cfg.classes || []).length || Math.max(1, (dimsOut[1] || 5)-4);
-    const count = dimsOut.at(-1); const channelsOut = dimsOut.length >= 3 ? dimsOut[dimsOut.length-2] : 4+classCount;
-    for (let i=0;i<count;i++) {
-      const read = c => channelsOut <= count ? flat[c*count+i] : flat[i*channelsOut+c];
-      let classId=0, score=-Infinity;
-      for (let c=0;c<classCount;c++) { const s=read(4+c); if(s>score){score=s;classId=c;} }
-      if(score<conf) continue;
-      const cx=read(0), cy=read(1), w=read(2), h=read(3);
-      rows.push({x1:cx-w/2,y1:cy-h/2,x2:cx+w/2,y2:cy+h/2,score,classId});
+function frameToPlanar(taskId, imageHandle) {
+  const task = kmodelManager.task(taskId);
+  const frame = resizeFrame(imageHandle.frame, task.shape.inputWidth, task.shape.inputHeight);
+  const { inputWidth:width, inputHeight:height, inputChannels:channels } = task.shape;
+  const planar = new Uint8Array(width * height * channels);
+  for (let y=0; y<height; y++) for (let x=0; x<width; x++) {
+    const source = (y * width + x) * 4, pixel = y * width + x;
+    if (channels === 1) planar[pixel] = Math.round(.299*frame.data[source] + .587*frame.data[source+1] + .114*frame.data[source+2]);
+    else {
+      planar[pixel] = frame.data[source];
+      planar[width*height + pixel] = frame.data[source+1];
+      planar[width*height*2 + pixel] = frame.data[source+2];
+      for (let c=3; c<channels; c++) planar[width*height*c + pixel] = 0;
     }
   }
-  const normalized = rows.map(r => ({...r,
-    x1: r.x1 <= 1 ? r.x1 : r.x1/iw, y1: r.y1 <= 1 ? r.y1 : r.y1/ih,
-    x2: r.x2 <= 1 ? r.x2 : r.x2/iw, y2: r.y2 <= 1 ? r.y2 : r.y2/ih
-  }));
-  return { task: 'yolo', detections: nms(normalized, nmsThreshold), classes: cfg.classes || [] };
+  return planar;
 }
 
 function buildBridge() {
   return {
     requestCameraFrame,
+    loopCondition: async () => { if (liveCameraMode) await requestCameraFrame(); else await new Promise(resolve => setTimeout(resolve, 0)); return true; },
     sensorReset: () => { targetSize=FRAME_SIZES.QVGA; windowing=null; hmirror=false; vflip=false; brightness=0; saturation=0; contrast=0; registers={}; return true; },
     setFrameSize: value => { const v=toJs(value); targetSize = Array.isArray(v) ? v.map(Number) : (FRAME_SIZES[String(v)] || FRAME_SIZES.QVGA); },
     setWindowing: value => { windowing=Array.from(toJs(value),Number); },
@@ -371,11 +326,17 @@ function buildBridge() {
     uartAny: () => uartQueue.length,
     uartRead: n => { const count=n==null||Number(n)<0?uartQueue.length:Math.min(Number(n),uartQueue.length); return Uint8Array.from(uartQueue.splice(0,count)); },
     uartReadline: () => { const idx=uartQueue.indexOf(10); const count=idx<0?uartQueue.length:idx+1; return count?Uint8Array.from(uartQueue.splice(0,count)):null; },
+    gpioInit: (pin,mode,pull,value=0) => { const key=String(pin); if (!(key in gpio)) gpio[key]=Number(mode)===0 && Number(pull)===1 ? 1 : Number(Boolean(value)); post('gpio',{pin:key,value:gpio[key],mode:Number(mode)===0?'IN':'OUT'}); return gpio[key]; },
     gpioGet: pin => Number(gpio[String(pin)] || 0),
     gpioSet: (pin,value,mode='OUT') => { gpio[String(pin)]=Number(Boolean(value)); post('gpio',{pin:String(pin),value:gpio[String(pin)],mode:String(mode)}); return gpio[String(pin)]; },
     ledSet: (index,color) => { const i=Math.max(0,Number(index)|0); while(ledState.length<=i)ledState.push([0,0,0]); ledState[i]=colorTuple(color).slice(0,3); },
     ledDisplay: () => post('led',{colors:ledState}),
-    kpuAvailable: () => false,
+    kpuAvailable: () => Boolean(kmodelManager?.available()),
+    kpuLoad: path => kmodelManager.load(String(path)),
+    kpuDeinit: id => kmodelManager.deinit(Number(id)),
+    kpuInitYolo: (id,threshold,nmsThreshold,anchorCount,anchors) => kmodelManager.initYolo(Number(id),threshold,nmsThreshold,anchorCount,toJs(anchors)),
+    kpuForward: (id,img) => Array.from(kmodelManager.forward(Number(id),frameToPlanar(Number(id),img))),
+    kpuRunYolo: (id,img) => kmodelManager.runYolo(Number(id),frameToPlanar(Number(id),img)),
     unsupported: name => { throw new Error(`未対応のAPIです: ${name}`); }
   };
 }
@@ -393,6 +354,7 @@ class Blob:
     def cx(self): return int(self._d.cx)
     def cy(self): return int(self._d.cy)
     def pixels(self): return int(self._d.pixels)
+    def area(self): return self.w()*self.h()
     def rotation(self): return float(self._d.rotation)
     def code(self): return int(self._d.code)
     def density(self): return float(self._d.density)
@@ -490,7 +452,7 @@ class GPIO:
     GPIO0='GPIO0'; GPIO1='GPIO1'; GPIO2='GPIO2'; GPIOHS0='GPIOHS0'; GPIOHS1='GPIOHS1'; GPIOHS2='GPIOHS2'
     def __init__(self,pin,mode=OUT,pull=PULL_NONE,value=0,*args,**kwargs):
         self.pin=pin; self.mode=mode
-        if mode != self.IN: bridge.gpioSet(str(pin),value,'OUT')
+        bridge.gpioInit(str(pin),mode,pull,value)
     def value(self,value=None):
         if value is None: return int(bridge.gpioGet(str(self.pin)))
         return int(bridge.gpioSet(str(self.pin),value,'IN' if self.mode==self.IN else 'OUT'))
@@ -517,16 +479,20 @@ class Detection:
     def classid(self): return int(self._d.classId)
     def rect(self): return (self.x(),self.y(),self.w(),self.h())
     def __getitem__(self,i): return (self.x(),self.y(),self.w(),self.h(),self.value(),self.classid())[i]
+    def __repr__(self): return "Detection(x={}, y={}, w={}, h={}, value={:.3f}, classid={})".format(self.x(),self.y(),self.w(),self.h(),self.value(),self.classid())
 class KPUTask:
-    def __init__(self,path): self.path=path
+    def __init__(self,path): self.path=path; self._id=int(bridge.kpuLoad(path))
 def _require_kpu():
-    if not bridge.kpuAvailable(): raise RuntimeError('KPUモデルが読み込まれていません。AIモデル欄でONNXモデルと設定JSONを選択してください。')
+    if not bridge.kpuAvailable(): raise RuntimeError('プロジェクトに.kmodelファイルがありません。FILESへ追加してください。')
 kpu=types.ModuleType('KPU')
 kpu.load=lambda path,*a,**k: KPUTask(path)
-kpu.deinit=lambda task,*a,**k: None
-kpu.init_yolo2=lambda *a,**k: _require_kpu()
-def _forward(task,img,*args,**kwargs): _require_kpu(); return KPUResult(bridge.kpuValues())
-def _run_yolo(task,img,*args,**kwargs): _require_kpu(); return [Detection(d) for d in bridge.kpuDetections()]
+kpu.deinit=lambda task,*a,**k: bridge.kpuDeinit(task._id)
+def _init_yolo(task,threshold,nms_value,anchor_num,anchors,*args,**kwargs):
+    _require_kpu(); return bridge.kpuInitYolo(task._id,threshold,nms_value,anchor_num,anchors)
+kpu.init_yolo2=_init_yolo
+def _forward(task,img,*args,**kwargs): _require_kpu(); return KPUResult(bridge.kpuForward(task._id,img._h))
+def _run_yolo(task,img,*args,**kwargs):
+    _require_kpu(); result=[Detection(d) for d in bridge.kpuRunYolo(task._id,img._h)]; return result if result else None
 kpu.forward=_forward; kpu.run_yolo2=_run_yolo; kpu.softmax=lambda values: KPUResult(values)
 sys.modules['KPU']=kpu
 
@@ -545,6 +511,14 @@ async function ensurePython() {
 
 self.onmessage = async event => {
   const payload = event.data;
+  if (payload?.type === 'uart-append') {
+    uartQueue.push(...new Uint8Array(payload.data || new ArrayBuffer(0)));
+    return;
+  }
+  if (payload?.type === 'gpio-update') {
+    gpio[String(payload.pin)] = Number(Boolean(payload.value));
+    return;
+  }
   if (payload?.type === 'camera-frame') {
     const pending = cameraFrameRequests.get(payload.requestId); if (!pending) return;
     cameraFrameRequests.delete(payload.requestId);
@@ -563,7 +537,9 @@ self.onmessage = async event => {
     sourceFrame = { width: payload.image.width, height: payload.image.height, data: new Uint8ClampedArray(payload.image.data) };
     latestFrame = cloneFrame(sourceFrame); targetSize = FRAME_SIZES.QVGA; windowing=null; hmirror=false; vflip=false; brightness=0; saturation=0; contrast=0; registers={};
     uartQueue = Array.from(new Uint8Array(payload.uart || new ArrayBuffer(0)));
-    gpio = { ...(payload.gpio || {}) }; ledState=[[0,0,0],[0,0,0],[0,0,0],[0,0,0]]; inference=null;
+    gpio = { ...(payload.gpio || {}) }; ledState=[[0,0,0],[0,0,0],[0,0,0],[0,0,0]];
+    if (payload.models?.length) post('status', { phase:'loading-kmodel', text:'K210 kmodelランタイムを読み込んでいます' });
+    kmodelManager = await KmodelManager.create(payload.models || []);
     const runtime = await ensurePython();
     self.bridge = buildBridge(); runtime.globals.set('bridge', self.bridge);
     await runtime.runPythonAsync(PYTHON_BOOTSTRAP);
@@ -580,11 +556,11 @@ self.onmessage = async event => {
     }
     const entryDirectory = String(payload.filename || '').replace(/\\/g, '/').includes('/') ? String(payload.filename).replace(/\\/g, '/').slice(0, String(payload.filename).replace(/\\/g, '/').lastIndexOf('/')) : '';
     await runtime.runPythonAsync(`import os, sys, importlib\nos.chdir(${JSON.stringify(workspace)})\nsys.path.insert(0, ${JSON.stringify(workspace)})\nsys.path.insert(0, ${JSON.stringify(`${workspace}/${entryDirectory}`)})\nimportlib.invalidate_caches()`);
-    post('status', { phase: 'executing', text: liveCameraMode ? 'カメラフレームを連続処理しています' : 'コードを実行しています', liveCamera:liveCameraMode });
+    post('status', { phase: 'executing', text: liveCameraMode ? 'カメラフレームを連続処理しています' : 'コードを実行しています', liveCamera:liveCameraMode, kmodel:Boolean(payload.models?.length) });
     const { prepared, limited, mappings } = prepareUnitVCode(payload.code, liveCameraMode);
     sourceMappings = mappings;
-    if (limited) post('log',{level:'system',text:'固定画像モードのため while(True) を1フレームだけ実行します。',time:stamp()});
-    if (liveCameraMode) post('log',{level:'system',text:'カメラモード: while(True) を維持し、sensor.snapshot() ごとに新しいフレームを取得します。停止ボタンで終了できます。',time:stamp()});
+    if (limited) post('log',{level:'system',text:'固定画像モードのためトップレベルの無限ループを1フレームだけ実行します。',time:stamp()});
+    if (liveCameraMode) post('log',{level:'system',text:'カメラモード: トップレベルの無限ループを維持し、ループごとに新しいフレームを取得します。停止ボタンで終了できます。',time:stamp()});
     await runtime.runPythonAsync(prepared, { filename: payload.filename || 'main.py' });
     const frame = latestFrame || sourceFrame;
     liveCameraMode = false;

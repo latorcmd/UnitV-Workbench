@@ -23,10 +23,13 @@ UnitV Browser Lab includes or is built with the open-source software listed belo
 | style-mod | 4.1.4 | MIT | <https://github.com/marijnh/style-mod> |
 | w3c-keyname | 2.2.8 | MIT | <https://github.com/marijnh/w3c-keyname> |
 | fflate | 0.8.3 | MIT | <https://github.com/101arrowz/fflate> |
+| nncase K210 emulator specification (adapted in the local kmodel WASM interpreter) | 0.1 / 0.2 | Apache-2.0 | <https://github.com/kendryte/nncase> |
 
 Pyodide is distributed under the Mozilla Public License 2.0. The full license text and corresponding source are available from <https://github.com/pyodide/pyodide/blob/0.28.3/LICENSE> and <https://github.com/pyodide/pyodide/tree/0.28.3>. UnitV Browser Lab does not modify Pyodide's source files; the published build copies the upstream runtime artifacts from the npm package.
 
 Ruff's npm package contains its MIT license and notices for code from autoflake, autotyping, Flake8 and related plugins, isort, pycodestyle, pydocstyle, Pyflakes, Pyright, pyupgrade, Rome Tools, RustPython, and rust-analyzer/text-size. Those notices remain in `node_modules/@astral-sh/ruff-wasm-web/LICENSE` after `npm install` and in the upstream repository at <https://github.com/astral-sh/ruff>.
+
+The K210 kmodel v3 WebAssembly interpreter follows register layouts, tensor layout, fixed-point rounding, pooling, and convolution behavior from nncase's K210 emulator, Copyright 2019-2020 Canaan Inc., licensed under the Apache License 2.0. The local implementation is independently adapted for a freestanding browser WebAssembly runtime. The Apache License text is available at <https://www.apache.org/licenses/LICENSE-2.0> and the referenced upstream source is available at <https://github.com/kendryte/nncase>.
 
 ## Build and development dependencies
 

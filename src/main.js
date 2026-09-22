@@ -29,7 +29,8 @@ import {
 const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_TEXT_BYTES = 1024 * 1024;
 const EXECUTION_LIMIT_MS = 8000;
-const APP_VERSION = '0.3.31';
+const KMODEL_EXECUTION_LIMIT_MS = 60000;
+const APP_VERSION = '0.4.0';
 const initialTheme = localStorage.getItem('unitv-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
 document.documentElement.dataset.theme = initialTheme;
 
@@ -155,7 +156,8 @@ document.querySelector('#app').innerHTML = `
         <section><h3>image</h3><p>resize / crop / copy / binary / find_blobs / draw_rectangle / draw_line / draw_circle / draw_cross / draw_string</p></section>
         <section><h3>UART・I/O</h3><p>UART read / readline / readchar / write / any、GPIO value、ws2812 set_led / display</p></section>
         <section><h3>カメラ設定</h3><p>レジスタ読書き、auto gain / exposure / white balance、brightness / saturation / contrast、windowing</p></section>
-      </div><p class="dialog-note">静止画像ではトップレベルの while(True) を1フレームだけ実行します。カメラでは各 snapshot() で新しいフレームを取得し、停止まで連続実行します。KPUは未対応です。</p>
+        <section><h3>KPU / kmodel v3</h3><p>load / init_yolo2 / run_yolo2 / forward / softmax / deinit（K210・8 bit重み・畳み込み＋Dequantize）</p></section>
+      </div><p class="dialog-note">静止画像ではトップレベルの while(True) / while(1) を1フレームだけ実行します。カメラではループごとに新しいフレームを取得し、停止まで連続実行します。KPUは8 bit重みのK210 kmodel v3とYOLO2 APIに対応します。</p>
     </form>
   </dialog>
 
@@ -167,6 +169,7 @@ document.querySelector('#app').innerHTML = `
         <a href="https://github.com/astral-sh/ruff" target="_blank" rel="noreferrer"><strong>Ruff WASM 0.16.1</strong><span>MIT License</span></a>
         <a href="https://github.com/codemirror" target="_blank" rel="noreferrer"><strong>CodeMirror 6 / Lezer</strong><span>MIT License</span></a>
         <a href="https://github.com/101arrowz/fflate" target="_blank" rel="noreferrer"><strong>fflate 0.8.3</strong><span>MIT License</span></a>
+        <a href="https://github.com/kendryte/nncase" target="_blank" rel="noreferrer"><strong>nncase K210 emulator specification</strong><span>Apache License 2.0</span></a>
       </div>
       <p class="license-note">各名称・商標はそれぞれの権利者に帰属します。本アプリはM5Stack、Sipeed、GitHub、各OSSプロジェクトの公式製品ではありません。</p>
       <div class="dialog-actions"><button value="close" class="ghost-button">閉じる</button></div>
@@ -318,7 +321,7 @@ let imageLoadPromise = null;
 let worker = null;
 let executionTimer = null;
 let running = false;
-let gpioState = { GPIO1: 0, GPIO2: 0, GPIOHS0: 0 };
+let gpioState = { GPIO1: 1, GPIO2: 1, GPIOHS0: 0 };
 let uartQueued = new Uint8Array();
 let cameraStream = null;
 let lastCameraCaptureAt = 0;
@@ -1541,11 +1544,12 @@ function handleWorkerMessage(event) {
       setRuntime('カメラ実行中', '停止ボタンを押すまで連続処理します', 'busy');
     }
   } else if (msg.type === 'status') {
-    const states = { 'loading-python':['Pythonを準備中',msg.text], 'loading-model':['モデルを準備中',msg.text], executing:['実行中',msg.liveCamera?'停止ボタンを押すまで連続処理します':`最大${EXECUTION_LIMIT_MS/1000}秒で停止します`] };
+    const limit = msg.kmodel ? KMODEL_EXECUTION_LIMIT_MS : EXECUTION_LIMIT_MS;
+    const states = { 'loading-python':['Pythonを準備中',msg.text], 'loading-kmodel':['KPUを準備中',msg.text], executing:['実行中',msg.liveCamera?'停止ボタンを押すまで連続処理します':`最大${limit/1000}秒で停止します`] };
     const state = states[msg.phase] || ['処理中',msg.text || '']; setRuntime(state[0], state[1], 'busy');
     if (msg.phase === 'executing') {
       clearTimeout(executionTimer); executionTimer = null;
-      if (!msg.liveCamera) executionTimer = setTimeout(() => stopExecution('実行時間が8秒を超えたため停止しました。'), EXECUTION_LIMIT_MS);
+      if (!msg.liveCamera) executionTimer = setTimeout(() => stopExecution(`実行時間が${limit/1000}秒を超えたため停止しました。`), limit);
     }
   } else if (msg.type === 'log') {
     addLog(msg.level || 'stdout', msg.text, msg.time);
@@ -1709,7 +1713,9 @@ async function presentRuntimeError(error, options = {}) {
 }
 
 function finishWithError(message, error = null, options = {}) {
-  clearTimeout(executionTimer); executionTimer = null; setRunning(false); setRuntime('エラー', 'シリアルモニタを確認してください', 'error');
+  clearTimeout(executionTimer); executionTimer = null;
+  if (executionTarget === 'simulator' && worker) { worker.terminate(); worker = null; }
+  setRunning(false); setRuntime('エラー', 'シリアルモニタを確認してください', 'error');
   addLog('error', message);
   if (error) void presentRuntimeError(error, options);
 }
@@ -1925,11 +1931,16 @@ async function runCode() {
     try { await captureCameraFrame(); } catch (error) { finishWithError(error.message); return; }
   }
   if (!sourceImage) { finishWithError('先に入力画像を選択してください。'); refs.imageFile.focus(); return; }
+  const modelEntries = visibleFiles().filter(file => file.kind === 'binary' && file.blob && file.path.toLowerCase().endsWith('.kmodel'));
+  let models;
+  try {
+    models = await Promise.all(modelEntries.map(async file => ({ name:file.path, data:await file.blob.arrayBuffer() })));
+  } catch (error) { finishWithError(`kmodelを読み込めませんでした: ${error.message}`); return; }
   setRunning(true); setRuntime('開始中', '入力データを準備しています', 'busy'); addLog('system', 'コードを実行します。');
   const imageCopy = new Uint8ClampedArray(sourceImage.data);
   const uartCopy = new Uint8Array(uartQueued);
-  const payload = { type:'run', code:getCode(), filename:activeFile.path, files:visibleFiles().filter(file=>isPythonEntry(file)).map(file=>({name:file.path,code:file.id===currentFileId?getCode():currentEntryText(file)})), cameraMode:Boolean(cameraStream), image:{width:sourceImage.width,height:sourceImage.height,data:imageCopy.buffer}, uart:uartCopy.buffer, gpio:{...gpioState} };
-  const transfers = [imageCopy.buffer, uartCopy.buffer];
+  const payload = { type:'run', code:getCode(), filename:activeFile.path, files:visibleFiles().filter(file=>isPythonEntry(file)).map(file=>({name:file.path,code:file.id===currentFileId?getCode():currentEntryText(file)})), models, cameraMode:Boolean(cameraStream), image:{width:sourceImage.width,height:sourceImage.height,data:imageCopy.buffer}, uart:uartCopy.buffer, gpio:{...gpioState} };
+  const transfers = [imageCopy.buffer, uartCopy.buffer, ...models.map(model => model.data)];
   ensureWorker().postMessage(payload, transfers);
 }
 
@@ -1990,7 +2001,7 @@ async function openProject(file) {
   if(!imported.length) imported.push(createEntry({projectId:importedProject.id,path:'main.py',kind:'text',text:'',order:0}));
   importedProject.activePath=data.activePath||data.activeFile||imported[0].path; projects.unshift(importedProject); await saveProjectRecord(importedProject); await saveEntries(imported);
   refs.uart.value=data.uart?.value||''; refs.uartFormat.value=data.uart?.format||'text';
-  gpioState={GPIO1:0,GPIO2:0,GPIOHS0:0,...(data.gpio||{})}; Object.entries(gpioState).forEach(([p,v])=>updateGpioUi(p,v));
+  gpioState={GPIO1:1,GPIO2:1,GPIOHS0:0,...(data.gpio||{})}; Object.entries(gpioState).forEach(([p,v])=>updateGpioUi(p,v));
   if(data.image?.dataUrl)await dataUrlToImage(data.image.dataUrl,data.image.name);
   await switchProject(importedProject.id);
   addLog('system',`プロジェクトを開きました: ${file.name}`);
@@ -2601,8 +2612,15 @@ serialTransport.onDisconnect = () => { if (!realConnectionBusy) void disconnectU
 refs.run.addEventListener('click', runCode); refs.stop.addEventListener('click', () => void stopExecution());
 $('#clear-log').addEventListener('click', () => { refs.terminal.innerHTML=''; addLog('system','ログを消去しました。'); });
 $('#download-image').addEventListener('click', () => refs.canvas.toBlob(blob => blob && downloadBlob(blob,'unitv-output.png'),'image/png'));
-$('#uart-queue').addEventListener('click', () => { try { uartQueued=parseUartInput(); addLog('system',`UART受信キューに ${uartQueued.length} byte を設定しました。`); } catch(error){finishWithError(error.message);} });
-document.querySelectorAll('[data-gpio]').forEach(button => button.addEventListener('click', () => { const pin=button.dataset.gpio; gpioState[pin]=gpioState[pin]?0:1; updateGpioUi(pin,gpioState[pin]); }));
+$('#uart-queue').addEventListener('click', () => { try {
+  uartQueued=parseUartInput();
+  if (running && executionTarget === 'simulator' && worker) { const liveBytes=new Uint8Array(uartQueued); worker.postMessage({type:'uart-append',data:liveBytes.buffer},[liveBytes.buffer]); }
+  addLog('system',`UART受信キューに ${uartQueued.length} byte を設定しました。`);
+} catch(error){finishWithError(error.message);} });
+document.querySelectorAll('[data-gpio]').forEach(button => button.addEventListener('click', () => {
+  const pin=button.dataset.gpio; gpioState[pin]=gpioState[pin]?0:1; updateGpioUi(pin,gpioState[pin]);
+  if (running && executionTarget === 'simulator' && worker) worker.postMessage({type:'gpio-update',pin,value:gpioState[pin]});
+}));
 
 $('#api-open').addEventListener('click',()=>$('#api-dialog').showModal());
 $('#license-open').addEventListener('click',()=>$('#license-dialog').showModal());
@@ -2668,5 +2686,6 @@ window.addEventListener('beforeunload', event => {
   worker?.terminate(); cameraStream?.getTracks().forEach(track=>track.stop()); if (serialTransport.connected) { void realUnitV.stop(); void realUnitV.setFrameBufferEnabled(false); }
 });
 
+Object.entries(gpioState).forEach(([pin,value]) => updateGpioUi(pin,value));
 addLog('system', '画像を選択し、コードを確認して「実行」を押してください。');
 await initializeEditor();

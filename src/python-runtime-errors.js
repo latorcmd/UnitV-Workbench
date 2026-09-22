@@ -121,11 +121,12 @@ function replaceWithColumnMappings(code, expression, replacementFactory) {
 }
 
 export function prepareUnitVCode(code, cameraMode = false) {
+  const loop = /^while\s*\(?\s*(?:True|1)\s*\)?\s*:/g;
   if (cameraMode) {
-    const transformed = replaceWithColumnMappings(code, /\bsensor\s*\.\s*snapshot\s*\(\s*\)/g, () => 'await sensor.snapshot_async()');
+    const transformed = replaceWithColumnMappings(code, loop, () => 'while await bridge.loopCondition():');
     return { prepared:transformed.code, mappings:transformed.mappings, limited:false };
   }
-  const transformed = replaceWithColumnMappings(code, /^while\s*\(?\s*True\s*\)?\s*:/g, () => 'for __unitv_browser_frame in range(1):');
+  const transformed = replaceWithColumnMappings(code, loop, () => 'for __unitv_browser_frame in range(1):');
   return { prepared:transformed.code, mappings:transformed.mappings, limited:transformed.mappings.length > 0 };
 }
 
