@@ -35,12 +35,12 @@ const APP_VERSION = '0.4.1';
 const initialTheme = localStorage.getItem('unitv-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
 document.documentElement.dataset.theme = initialTheme;
 
-document.querySelector('#app').innerHTML = `
+document.querySelector('#app').innerHTML = /*html*/ `
   <main class="app-shell">
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
-        <div><h1>${APP_NAME} <small class="app-version">v${APP_VERSION}</small></h1><p>UnitVコードを、ブラウザで試す。</p></div>
+        <div><h1>${APP_NAME} <small class="app-version">v${APP_VERSION}</small></h1><p>UnitVコードを、ブラウザで編集・検証・実行。</p></div>
       </div>
       <div class="top-actions">
         <span class="privacy-pill"><span></span>画像・コードは端末内で処理</span>
@@ -546,7 +546,7 @@ function addLog(level, text, time = new Date().toLocaleTimeString('ja-JP', { hou
   const line = document.createElement('div');
   line.className = `log-line ${level}`;
   const safeText = String(text).replace(/\n$/, '');
-  line.innerHTML = `<span class="time">${time}</span><span class="log-tag">[${level}]</span><span class="log-text"></span>`;
+  line.innerHTML = /*html*/ `<span class="time">${time}</span><span class="log-tag">[${level}]</span><span class="log-text"></span>`;
   line.querySelector('.log-text').textContent = safeText || ' ';
   refs.terminal.append(line);
   while (refs.terminal.children.length > 300) refs.terminal.firstElementChild?.remove();
@@ -727,7 +727,7 @@ function renderFileList() {
     const label = basename(node.path);
     if (node.type === 'folder') {
       const expanded = expandedFolders.has(node.path);
-      open.innerHTML = `<span>${expanded ? '▾' : '▸'}</span><b></b>`; open.querySelector('b').textContent = label;
+      open.innerHTML = /*html*/ `<span>${expanded ? '▾' : '▸'}</span><b></b>`; open.querySelector('b').textContent = label;
       open.addEventListener('click', () => { expanded ? expandedFolders.delete(node.path) : expandedFolders.add(node.path); renderFileList(); });
     } else {
       const icon = node.file.kind === 'image' ? 'IMG' : node.file.kind === 'text' ? (node.path.toLowerCase().endsWith('.py') ? 'PY' : 'TXT') : 'BIN';
