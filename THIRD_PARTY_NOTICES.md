@@ -1,6 +1,6 @@
 # Third-party software notices
 
-UnitV Browser Lab includes or is built with the open-source software listed below. The versions are taken from `package-lock.json`. Copyrights and trademarks belong to their respective owners. This project is not endorsed by M5Stack, Sipeed, GitHub, or the projects listed here.
+UnitV Workbench includes or is built with the open-source software listed below. The versions are taken from `package-lock.json`. Copyrights and trademarks belong to their respective owners. This project is not endorsed by M5Stack, Sipeed, GitHub, or the projects listed here.
 
 ## Software shipped to the browser
 
@@ -25,7 +25,7 @@ UnitV Browser Lab includes or is built with the open-source software listed belo
 | fflate | 0.8.3 | MIT | <https://github.com/101arrowz/fflate> |
 | nncase K210 emulator specification (adapted in the local kmodel WASM interpreter) | 0.1 / 0.2 | Apache-2.0 | <https://github.com/kendryte/nncase> |
 
-Pyodide is distributed under the Mozilla Public License 2.0. The full license text and corresponding source are available from <https://github.com/pyodide/pyodide/blob/0.28.3/LICENSE> and <https://github.com/pyodide/pyodide/tree/0.28.3>. UnitV Browser Lab does not modify Pyodide's source files; the published build copies the upstream runtime artifacts from the npm package.
+Pyodide is distributed under the Mozilla Public License 2.0. The full license text and corresponding source are available from <https://github.com/pyodide/pyodide/blob/0.28.3/LICENSE> and <https://github.com/pyodide/pyodide/tree/0.28.3>. UnitV Workbench does not modify Pyodide's source files; the published build copies the upstream runtime artifacts from the npm package.
 
 Ruff's npm package contains its MIT license and notices for code from autoflake, autotyping, Flake8 and related plugins, isort, pycodestyle, pydocstyle, Pyflakes, Pyright, pyupgrade, Rome Tools, RustPython, and rust-analyzer/text-size. Those notices remain in `node_modules/@astral-sh/ruff-wasm-web/LICENSE` after `npm install` and in the upstream repository at <https://github.com/astral-sh/ruff>.
 

@@ -1,14 +1,14 @@
-# UnitV Browser Lab
+# UnitV Workbench
 
-Current version: **0.4.0**
+Current version: **0.4.1**
 
-UnitV / MaixPy向けコードを、画像または端末カメラを入力としてブラウザ内で試す学習用シミュレーターです。画像・コード・UARTデータ・ローカルプロジェクトはサーバーへ保存しません。
+UnitV向けPythonコードを、画像または端末カメラを入力としてブラウザ内で編集・検証し、実機でも実行できる開発ワークベンチです。画像・コード・UARTデータ・ローカルプロジェクトはサーバーへ保存しません。
 
 ## 主な機能
 
 - `sensor` / `image` / UART / GPIO / WS2812の主要APIを疑似実行
 - 静止画像とライブカメラに対応。ライブ時はトップレベルの`while(True)` / `while(1)`を維持し、ループごとに新しいフレームを取得
-- K210用8 bit `kmodel v3`をWebAssemblyで直接実行し、MaixPyの`kpu.load` / `init_yolo2` / `run_yolo2`へ接続（ONNX不要）
+- K210用8 bit `kmodel v3`をWebAssemblyで直接実行し、UnitVコードの`kpu.load` / `init_yolo2` / `run_yolo2`へ接続（ONNX不要）
 - Python構文色分け、インデントガイド、構文・実行エラーの位置表示、入力補完、検索・置換、undo/redo、独立スクロール、全画面編集
 - IndexedDBに複数プロジェクト、フォルダ、複数ファイルを永続保存。`Ctrl+S`ではRuffでPythonを整形して保存し、`Ctrl+Shift+S`で全ファイルを保存
 - FILESでファイル／フォルダの作成・移動・コピー・ダウンロード、ドラッグ＆ドロップ、クリップボードのファイル貼り付け、独自右クリックメニューに対応
@@ -32,7 +32,7 @@ UnitV / MaixPy向けコードを、画像または端末カメラを入力とし
 
 KPUを使う場合は`.kmodel`をFILESへ追加し、UnitVコードと同じ名前で`kpu.load('/sd/m.kmodel')`のように指定します。`/sd/`は仮想パスとして扱うため、プロジェクト内の`m.kmodel`へ自動解決されます。設定JSONやONNXは不要で、アンカー・閾値・NMS値は実機と同じ`kpu.init_yolo2()`から取得します。
 
-実機で試す場合はChromeまたはEdgeのHTTPS/localhost環境で「実行先」を「実機 UnitV」に切り替え、「実機接続」を押します。実行時だけ選択中のPythonを送信し、補助ファイルやkmodelはUnitVへ書き込みません。通常の切断操作ではスクリプト停止、フレームバッファ無効化、リセットを行います。Windows版ChromeでCOMポートを閉じ直す際の失敗を避けるため、REPLからIDEモードへの切替後も115200 baudを維持します。許可済みポートが1台だけなら再接続時に自動で再利用します。
+実機で試す場合はChromeまたはEdgeのHTTPS/localhost環境で「実行先」を「実機 UnitV」に切り替え、「実機接続」を押します。実行時だけ選択中のPythonを送信し、補助ファイルやkmodelはUnitVへ書き込みません。通常の切断操作ではスクリプト停止、フレームバッファ無効化、リセットを行います。Windows版ChromeでCOMポートを閉じ直す際の失敗を避けるため、REPLから実機通信モードへの切替後も115200 baudを維持します。許可済みポートが1台だけなら再接続時に自動で再利用します。
 
 本体へ残す場合は、実機接続後に「実機へ書込」を押します。確認画面で実行すると既存の`/flash/main.py`を上書きします。書き込み後の再起動を有効にすると、USB接続を安全に終了して保存したプログラムを起動します。書き込み対象は選択中のPythonだけです。
 
@@ -58,7 +58,7 @@ KPUを使う場合は`.kmodel`をFILESへ追加し、UnitVコードと同じ名�
 - kmodel推論はCPU上のWebAssemblyでK210命令を再現するため、実機KPUより低速です。静止画像のkmodel実行だけは上限を60秒に拡張します
 - GitHub連携には公開版のWorkerが必要です。オフライン配布版ではローカル編集・画像処理・プロジェクト保存を利用できます。
 - 英語の実行エラーは、対応するデスクトップ版Chromeでのみ内蔵Language Detector／Translatorによる端末内翻訳を選択できます。その他の環境でも基本の日本語説明は表示します。
-- Web Serial実機接続はデスクトップ版Chrome/Edgeで利用できます。実機側のMaixPyファームウェアやUSB変換回路によってはIDEモード切替を確認する必要があります。
+- Web Serial実機接続はデスクトップ版Chrome/Edgeで利用できます。UnitV本体のファームウェアやUSB変換回路によっては実機通信モードへの切替を確認する必要があります。
 
 ## ローカル利用
 
@@ -96,4 +96,4 @@ GitHub Pagesは静的なシミュレーター部分だけなら利用できま�
 
 ## ライセンス
 
-UnitV Browser Labの自作部分は[MIT License](LICENSE)で公開します。利用しているOSSとそのライセンスは[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)にまとめています。アプリ画面右上の「ライセンス」からも主要な同梱OSSを確認できます。
+UnitV Workbenchの自作部分は[MIT License](LICENSE)で公開します。利用しているOSSとそのライセンスは[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)にまとめています。アプリ画面右上の「ライセンス」からも主要な同梱OSSを確認できます。

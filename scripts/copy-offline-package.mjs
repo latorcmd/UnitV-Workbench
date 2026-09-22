@@ -4,7 +4,7 @@ import { strToU8, zipSync } from 'fflate';
 
 const root = process.cwd();
 const clientDirectory = resolve(root, 'dist/client');
-const packageName = 'unitv-browser-lab-offline.zip';
+const packageName = 'unitv-workbench-offline.zip';
 const files = {};
 
 async function collect(directory) {

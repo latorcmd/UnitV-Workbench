@@ -11,7 +11,7 @@ import { MergeView } from '@codemirror/merge';
 import { openSearchPanel, search, searchKeymap } from '@codemirror/search';
 import { LatestBranchLoader } from './github-branch-loader.js';
 import { loadCompleteGitTree } from './github-tree.js';
-import { MaixPyIdeClient } from './maixpy-ide.js';
+import { UnitVDeviceClient } from './maixpy-ide.js';
 import { WebSerialTransport } from './serial-transport.js';
 import { ensureStorageCapacity, formatByteSize } from './storage-capacity.js';
 import { streamZipResponse } from './streaming-zip.js';
@@ -30,7 +30,8 @@ const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_TEXT_BYTES = 1024 * 1024;
 const EXECUTION_LIMIT_MS = 8000;
 const KMODEL_EXECUTION_LIMIT_MS = 60000;
-const APP_VERSION = '0.4.0';
+const APP_NAME = 'UnitV Workbench';
+const APP_VERSION = '0.4.1';
 const initialTheme = localStorage.getItem('unitv-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
 document.documentElement.dataset.theme = initialTheme;
 
@@ -39,7 +40,7 @@ document.querySelector('#app').innerHTML = `
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
-        <div><h1>UnitV Browser Lab <small class="app-version">v${APP_VERSION}</small></h1><p>MaixPyを、ブラウザで試す。</p></div>
+        <div><h1>${APP_NAME} <small class="app-version">v${APP_VERSION}</small></h1><p>UnitVコードを、ブラウザで試す。</p></div>
       </div>
       <div class="top-actions">
         <span class="privacy-pill"><span></span>画像・コードは端末内で処理</span>
@@ -52,7 +53,7 @@ document.querySelector('#app').innerHTML = `
         <button class="ghost-button" id="github-open" type="button">GitHub</button>
         <button class="ghost-button" id="project-open" type="button">読込</button>
         <button class="ghost-button" id="project-save" type="button">書出</button>
-        <a class="ghost-button download-link" href="/unitv-browser-lab-offline.zip" download>オフライン版</a>
+        <a class="ghost-button download-link" href="/unitv-workbench-offline.zip" download>オフライン版</a>
         <input id="project-file" class="visually-hidden" type="file" accept="application/json,.unitvproj" />
       </div>
     </header>
@@ -163,7 +164,7 @@ document.querySelector('#app').innerHTML = `
 
   <dialog id="license-dialog" class="dialog license-dialog">
     <form method="dialog"><div class="dialog-head"><div><span class="panel-kicker">OPEN SOURCE</span><h2>ライセンス</h2></div><button value="close" aria-label="閉じる">×</button></div>
-      <p class="dialog-intro"><strong>UnitV Browser Lab v${APP_VERSION}</strong> の自作部分はMIT Licenseで公開します。ブラウザへ同梱している主なOSSは次のとおりです。完全な一覧と表記はリポジトリの <code>LICENSE</code> と <code>THIRD_PARTY_NOTICES.md</code> にあります。</p>
+      <p class="dialog-intro"><strong>${APP_NAME} v${APP_VERSION}</strong> の自作部分はMIT Licenseで公開します。ブラウザへ同梱している主なOSSは次のとおりです。完全な一覧と表記はリポジトリの <code>LICENSE</code> と <code>THIRD_PARTY_NOTICES.md</code> にあります。</p>
       <div class="license-list">
         <a href="https://github.com/pyodide/pyodide" target="_blank" rel="noreferrer"><strong>Pyodide 0.28.3</strong><span>Mozilla Public License 2.0</span></a>
         <a href="https://github.com/astral-sh/ruff" target="_blank" rel="noreferrer"><strong>Ruff WASM 0.16.1</strong><span>MIT License</span></a>
@@ -257,7 +258,7 @@ document.querySelector('#app').innerHTML = `
           </section>`).join('')}
           <p class="threshold-gauge-help">2つの点をドラッグして範囲を調整します。つまみを選択して矢印キーを押すと1ずつ動かせます。</p>
           <div class="threshold-summary">
-            <div class="threshold-result"><span>MaixPy形式</span><code id="threshold-value">(0, 100, -128, 127, -128, 127)</code></div>
+            <div class="threshold-result"><span>UnitV用LAB値</span><code id="threshold-value">(0, 100, -128, 127, -128, 127)</code></div>
             <div class="threshold-stats" id="threshold-stats">画像上の対象色を選択してください。</div>
           </div>
         </div>
@@ -287,7 +288,7 @@ document.querySelector('#app').innerHTML = `
         <input id="github-owner" type="hidden"><input id="github-repo" type="hidden">
         <label><span>ブランチ</span><select id="github-branch" disabled><option value="">リポジトリを選択してください</option></select></label>
         <label><span>操作対象</span><input id="github-project-target" value="プロジェクト全体" disabled></label>
-        <label class="github-message-field"><span>コミットメッセージ</span><input id="github-message" value="Update from UnitV Browser Lab"></label>
+        <label class="github-message-field"><span>コミットメッセージ</span><input id="github-message" value="Update from ${APP_NAME}"></label>
       </div>
       <div class="github-repository-actions"><button type="button" class="ghost-button" id="github-refresh">リポジトリ一覧を更新</button><button type="button" class="run-button" id="github-clone">新規プロジェクトへクローン</button></div>
       <div class="github-worktree" id="github-worktree"><strong>GitHubの状態</strong><span>まず接続確認またはプルを実行してください。</span><button type="button" id="github-discard" hidden>保留コミットを破棄</button></div>
@@ -362,7 +363,7 @@ let githubBranches = [];
 let githubBranchBusy = false;
 const githubBranchLoader = new LatestBranchLoader();
 const serialTransport = new WebSerialTransport();
-const realUnitV = new MaixPyIdeClient(serialTransport, {
+const realUnitV = new UnitVDeviceClient(serialTransport, {
   onTrace:({ step, message, level }) => addLog(level || 'debug', `[${step}] ${message}`)
 });
 let executionTarget = localStorage.getItem('unitv-execution-target') === 'unitv' ? 'unitv' : 'simulator';
@@ -606,7 +607,7 @@ function renderUnitVConnection(message = '') {
   refs.unitvConnect.disabled = running || realConnectionBusy || !serialTransport.supported;
   refs.unitvStop.disabled = !connected || (!running && !realUnitV.ideReady) || realConnectionBusy;
   refs.unitvFlash.disabled = running || realConnectionBusy || !connected || !isPythonEntry(activeEntry());
-  refs.unitvConnection.textContent = message || (connected ? (realUnitV.ideReady ? 'IDEモード接続中' : 'USB接続中') : serialTransport.supported ? '未接続' : 'Chrome / Edgeのみ対応');
+  refs.unitvConnection.textContent = message || (connected ? (realUnitV.ideReady ? '実機通信モード' : 'USB接続中') : serialTransport.supported ? '未接続' : 'Chrome / Edgeのみ対応');
   refs.unitvConnection.classList.toggle('connected', connected);
   if (executionTarget === 'unitv') $('#serial-baud').textContent = `実機 · ${serialTransport.baudRate || 115200} baud`;
 }
@@ -1770,7 +1771,7 @@ async function connectUnitV() {
   try {
     await realUnitV.connectConsole();
     renderUnitVConnection();
-    setRuntime('UnitV接続', '実行するとIDEモードへ切り替えます', 'success');
+    setRuntime('UnitV接続', '実行すると実機通信モードへ切り替えます', 'success');
     addLog('system', `UnitVへUSB接続しました（${serialTransport.baudRate} baud）。`);
   } catch (error) {
     try { await serialTransport.close(); } catch { /* connection never fully opened */ }
@@ -1826,9 +1827,9 @@ async function flashActiveProgram() {
   refs.run.disabled = true; refs.stop.disabled = true; refs.executionTarget.disabled = true;
   renderUnitVConnection('書き込み準備中…');
   try {
-    setRuntime('書き込み準備中', 'UnitVをMaixPy IDEモードへ切り替えています', 'busy');
+    setRuntime('書き込み準備中', 'UnitVを実機通信モードへ切り替えています', 'busy');
     addLog('system', `${file.path} を /flash/main.py へ書き込みます。`);
-    await realUnitV.activateIde(); renderUnitVConnection('IDEモード接続中');
+    await realUnitV.activateIde(); renderUnitVConnection('実機通信モード');
     await realUnitV.stop(); await sleep(160);
     const saved = await realUnitV.saveFile('/flash/main.py', codeBytes, {
       onProgress: ratio => {
@@ -1846,7 +1847,7 @@ async function flashActiveProgram() {
       setRuntime('書き込み完了', 'UnitVを再起動し、main.pyを自動実行しました', 'success');
       addLog('system', 'UnitVを再起動しました。書き込んだmain.pyは本体上で動作します。');
     } else {
-      renderUnitVConnection('IDEモード接続中');
+      renderUnitVConnection('実機通信モード');
       setRuntime('書き込み完了', '/flash/main.pyへ保存しました', 'success');
     }
   } catch (error) {
@@ -1864,7 +1865,7 @@ async function runOnUnitV(activeFile) {
   const generation = ++realPollGeneration;
   const abortController = new AbortController();
   realExecutionAbortController = abortController;
-  setRuntime('UnitV準備中', 'MaixPy IDEモードへ切り替えています', 'busy'); addLog('system', `実機で実行します: ${activeFile.path}`);
+  setRuntime('UnitV準備中', 'UnitVを実機通信モードへ切り替えています', 'busy'); addLog('system', `実機で実行します: ${activeFile.path}`);
   try {
     await realUnitV.activateIde({ signal:abortController.signal });
     if (!running || generation !== realPollGeneration || abortController.signal.aborted) return;
@@ -1879,7 +1880,7 @@ async function runOnUnitV(activeFile) {
       if (result.frame && generation === realPollGeneration) await drawRealFrame(result.frame);
       await sleep(70);
     }
-    // SCRIPT_RUNNINGはMaixPyファームウェアによって瞬間的にfalseを返すことがある。
+    // SCRIPT_RUNNINGはUnitVのファームウェアによって瞬間的にfalseを返すことがある。
     // 実機の常駐ループを誤って終了扱いにせず、停止操作で世代が変わるまで監視を続ける。
     return;
   } catch (error) {
@@ -1974,7 +1975,7 @@ async function saveProject() {
     baseText:entry.kind === 'text' ? entry.baseText : undefined
   })));
   const source = currentProject.source?.type === 'github' ? { ...currentProject.source, pendingCommit:undefined } : { type:'local' };
-  const project = { version:4, app:'UnitV Browser Lab', name:currentProject.name, savedAt:new Date().toISOString(), activePath:activeEntry()?.path, source, entries, uart:{value:refs.uart.value,format:refs.uartFormat.value}, gpio:{...gpioState}, image:{name:sourceImageName} };
+  const project = { version:4, app:APP_NAME, name:currentProject.name, savedAt:new Date().toISOString(), activePath:activeEntry()?.path, source, entries, uart:{value:refs.uart.value,format:refs.uartFormat.value}, gpio:{...gpioState}, image:{name:sourceImageName} };
   if ($('#embed-image').checked && sourceImageDataUrl) project.image.dataUrl=sourceImageDataUrl;
   const safeName = currentProject.name.replace(/[\\/:*?"<>|]/g, '-');
   downloadBlob(new Blob([JSON.stringify(project,null,2)],{type:'application/json'}), `${safeName}.unitvproj`); $('#save-dialog').close(); addLog('system','プロジェクトを書き出しました。');
@@ -2010,7 +2011,7 @@ async function openProject(file) {
 function githubSettings() {
   return {
     owner: $('#github-owner').value.trim(), repo: $('#github-repo').value.trim(), branch: $('#github-branch').value.trim() || 'main',
-    message: $('#github-message').value.trim() || 'Update from UnitV Browser Lab'
+    message: $('#github-message').value.trim() || `Update from ${APP_NAME}`
   };
 }
 
@@ -2276,7 +2277,7 @@ async function runGithubAction(progressMessage, action) {
 function linkedGithubSettings() {
   const source = currentProject?.source;
   if (source?.type !== 'github') throw new Error('GitHubからクローンしたプロジェクトを選択してください。');
-  return { owner:source.owner, repo:source.repo, branch:source.branch, message:$('#github-message').value.trim() || 'Update from UnitV Browser Lab' };
+  return { owner:source.owner, repo:source.repo, branch:source.branch, message:$('#github-message').value.trim() || `Update from ${APP_NAME}` };
 }
 
 function imageMime(path) {

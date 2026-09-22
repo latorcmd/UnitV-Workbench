@@ -5,7 +5,7 @@ function delay(milliseconds) {
 function serialOpenError(error) {
   const message = error instanceof Error ? error.message : String(error);
   if (/failed to open serial port/i.test(message) || error?.name === 'NetworkError') {
-    return new Error('シリアルポートを開けませんでした。選択したM5Stackポートを使っているシリアルモニタやMaixPy IDEを閉じ、UnitVをリセットしてから再接続してください。', { cause:error });
+    return new Error('シリアルポートを開けませんでした。選択したM5StackポートでUnitVと通信している他のアプリを閉じ、UnitVをリセットしてから再接続してください。', { cause:error });
   }
   return error instanceof Error ? error : new Error(message);
 }

@@ -1,5 +1,5 @@
 /*
- * Minimal nncase v3 / K210 kmodel interpreter for UnitV Browser Lab.
+ * Minimal nncase v3 / K210 kmodel interpreter for UnitV Workbench.
  *
  * The register decoding and fixed-point arithmetic follow the Apache-2.0
  * nncase 0.1/0.2 K210 emulator. This file intentionally has no libc

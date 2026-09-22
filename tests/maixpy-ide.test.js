@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildFileSavePayload, commandHeader, MaixPyIdeClient, MAIXPY_COMMAND,
+  buildFileSavePayload, commandHeader, UnitVDeviceClient, MAIXPY_COMMAND,
   MAIXPY_CONSOLE_BAUD, MAIXPY_IDE_BAUD, MAIXPY_STATUS_MAGIC
 } from '../src/maixpy-ide.js';
 
@@ -63,13 +63,13 @@ class ActiveIdeTransport {
 test('reconnect detects IDE mode before sending REPL control bytes', async () => {
   const transport = new ActiveIdeTransport();
   const traces = [];
-  const client = new MaixPyIdeClient(transport, { onTrace:trace => traces.push(trace) });
+  const client = new UnitVDeviceClient(transport, { onTrace:trace => traces.push(trace) });
   await client.activateIde();
   assert.equal(client.ideReady, true);
   assert.deepEqual(transport.writes.map(packet => [...packet]), [
     [...commandHeader(MAIXPY_COMMAND.QUERY_STATUS, 4)]
   ]);
-  assert.match(traces.find(trace => trace.step === 'IDE-01R').message, /起動済みのIDEモード/);
+  assert.match(traces.find(trace => trace.step === 'IDE-01R').message, /起動済みの実機通信モード/);
   assert.equal(traces.some(trace => trace.step === 'IDE-02'), false);
 });
 
@@ -77,7 +77,7 @@ test('IDE preparation can be cancelled while waiting for the REPL', async () => 
   const transport = new MockTransport();
   transport.buffered = [];
   const controller = new AbortController();
-  const client = new MaixPyIdeClient(transport);
+  const client = new UnitVDeviceClient(transport);
   const pending = client.activateIde({ signal:controller.signal });
   setTimeout(() => controller.abort(), 20);
   await assert.rejects(pending, error => error?.name === 'AbortError');
@@ -95,7 +95,7 @@ test('silent REPL recovery reopens the same baud rate and retries', async () => 
   ];
   transport.takeBuffered = () => transport.reopens.length ? (transport.recoveredReplies.shift() || new Uint8Array()) : new Uint8Array();
   const traces = [];
-  const client = new MaixPyIdeClient(transport, {
+  const client = new UnitVDeviceClient(transport, {
     onTrace:trace => traces.push(trace),
     replInitialTimeoutMs:1,
     replRecoveryTimeoutMs:2_000
@@ -124,7 +124,7 @@ test('stalled boot output triggers another automatic recovery cycle', async () =
     return new Uint8Array();
   };
   const traces = [];
-  const client = new MaixPyIdeClient(transport, {
+  const client = new UnitVDeviceClient(transport, {
     onTrace:trace => traces.push(trace),
     replInitialTimeoutMs:1,
     replRecoveryTimeoutMs:1,
@@ -145,7 +145,7 @@ test('camera probe stall waits without repeatedly resetting the UnitV', async ()
     return new TextEncoder().encode('[MAIXPY]: find ov7740\r\n');
   };
   const traces = [];
-  const client = new MaixPyIdeClient(transport, {
+  const client = new UnitVDeviceClient(transport, {
     onTrace:trace => traces.push(trace),
     replInitialTimeoutMs:1,
     replRecoveryTimeoutMs:1,
@@ -161,7 +161,7 @@ test('IDE mode stays at the open console baud rate on Windows Web Serial', async
   assert.equal(MAIXPY_IDE_BAUD, MAIXPY_CONSOLE_BAUD);
   const transport = new MockTransport([le32(MAIXPY_STATUS_MAGIC)]);
   const traces = [];
-  const client = new MaixPyIdeClient(transport, { onTrace:trace => traces.push(trace) });
+  const client = new UnitVDeviceClient(transport, { onTrace:trace => traces.push(trace) });
   await client.activateIde();
   assert.deepEqual(transport.reopens, []);
   const bootstrapPacket = transport.writes.find(packet => new TextDecoder().decode(packet).includes('from machine import UART'));
@@ -177,7 +177,7 @@ test('IDE mode stays at the open console baud rate on Windows Web Serial', async
   ]);
 });
 
-test('command header uses MaixPy little-endian framing', () => {
+test('command header uses UnitV firmware little-endian framing', () => {
   assert.deepEqual([...commandHeader(MAIXPY_COMMAND.SCRIPT_EXEC, 0x12345678)], [0x30, 0x05, 0x78, 0x56, 0x34, 0x12]);
 });
 
@@ -186,7 +186,7 @@ test('poll reads stdout, framebuffer JPEG and running state in order', async () 
   const transport = new MockTransport([
     le32(3), new TextEncoder().encode('ok\n'), frameInfo(224, 224, jpeg.length), jpeg, le32(1)
   ]);
-  const client = new MaixPyIdeClient(transport);
+  const client = new UnitVDeviceClient(transport);
   client.ideReady = true;
   const result = await client.poll();
   assert.equal(new TextDecoder().decode(result.stdout), 'ok\n');
@@ -201,7 +201,7 @@ test('poll reads stdout, framebuffer JPEG and running state in order', async () 
 
 test('framebuffer enable packet includes the trailing int16 flag', async () => {
   const transport = new MockTransport();
-  const client = new MaixPyIdeClient(transport);
+  const client = new UnitVDeviceClient(transport);
   client.ideReady = true;
   await client.setFrameBufferEnabled(true);
   assert.deepEqual([...transport.writes[0]], [0x30, MAIXPY_COMMAND.FB_ENABLE, 0, 0, 0, 0, 1, 0]);
@@ -221,7 +221,7 @@ test('file-save payload contains digest, aligned filename and program bytes', as
 
 test('saveFile waits for UnitV flash verification status', async () => {
   const transport = new MockTransport([le32(0), le32(5), le32(0)]);
-  const client = new MaixPyIdeClient(transport);
+  const client = new UnitVDeviceClient(transport);
   client.ideReady = true;
   const progress = [];
   const result = await client.saveFile('/flash/main.py', new TextEncoder().encode('x=1\n'), { onProgress:value => progress.push(value) });

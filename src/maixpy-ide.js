@@ -178,13 +178,13 @@ export class MaixPyIdeClient {
     try {
       const received = await this.transport.readUntil(expectedStatus, 1_000, 4096);
       throwIfAborted(signal);
-      this.#trace('IDE-01R', `起動済みのIDEモードを検出しました（前置き ${received.byteLength - expectedStatus.byteLength} byte）。`);
+      this.#trace('IDE-01R', `起動済みの実機通信モードを検出しました（前置き ${received.byteLength - expectedStatus.byteLength} byte）。`);
       return true;
     } catch (error) {
       throwIfAborted(signal);
       const message = error?.message || String(error);
       if (!/IDE応答を確認できませんでした|タイムアウト/.test(message)) throw error;
-      this.#trace('IDE-01R', `IDEモード応答はありませんでした。REPLからの切り替えを続けます（${message}）`);
+      this.#trace('IDE-01R', `実機通信モードの応答はありませんでした。REPLからの切り替えを続けます（${message}）`);
       return false;
     }
   }
@@ -208,7 +208,7 @@ export class MaixPyIdeClient {
       let stage = 'IDE-00';
       try {
         throwIfAborted(signal);
-        if (this.ideReady) { this.#trace('IDE-00', 'IDEモードは既に準備済みです。'); return; }
+        if (this.ideReady) { this.#trace('IDE-00', '実機通信モードは既に準備済みです。'); return; }
         if (!this.transport.connected) throw new Error('先にUnitVを接続してください。');
         if (this.transport.baudRate !== MAIXPY_CONSOLE_BAUD) {
           stage = 'IDE-01';
@@ -217,7 +217,7 @@ export class MaixPyIdeClient {
           throwIfAborted(signal);
         }
         stage = 'IDE-01';
-        this.#trace(stage, '前回の接続でIDEモードが本体に残っていないか確認します。');
+        this.#trace(stage, '前回の接続で実機通信モードが本体に残っていないか確認します。');
         if (await this.#detectActiveIde(signal)) {
           this.ideReady = true;
           return;
@@ -268,7 +268,7 @@ export class MaixPyIdeClient {
         const rawReply = await this.#waitForReplPrompt({ raw:true, timeoutMs:3_000, signal });
         this.#trace('IDE-03R', `raw REPLを確認しました（${rawReply.attempts}回、${receivedPreview(rawReply.bytes)}）。`);
         stage = 'IDE-04';
-        this.#trace(stage, `UART.repl_uart()をIDEモードへ初期化します（${MAIXPY_IDE_BAUD} baud）。`);
+        this.#trace(stage, `UART.repl_uart()をUnitV実機通信へ初期化します（${MAIXPY_IDE_BAUD} baud）。`);
         this.transport.discardBuffered();
         const bootstrap = [
           'from machine import UART',
@@ -339,7 +339,7 @@ export class MaixPyIdeClient {
 
   async execute(code) {
     return this.#serialized(async () => {
-      if (!this.ideReady) throw new Error('UnitVがIDEモードではありません。');
+      if (!this.ideReady) throw new Error('UnitVが実機通信モードではありません。');
       const bytes = new TextEncoder().encode(code);
       this.#trace('RUN-01', `スクリプト ${bytes.byteLength} byteをUnitVへ送信します。`);
       await this.transport.write(commandHeader(MAIXPY_COMMAND.SCRIPT_EXEC, bytes.byteLength));
@@ -367,7 +367,7 @@ export class MaixPyIdeClient {
 
   async saveFile(path, content, { onProgress = () => {}, timeoutMs = 20_000 } = {}) {
     return this.#serialized(async () => {
-      if (!this.ideReady) throw new Error('UnitVがIDEモードではありません。');
+      if (!this.ideReady) throw new Error('UnitVが実機通信モードではありません。');
       const data = content instanceof Uint8Array ? content : new Uint8Array(content);
       this.#trace('FLASH-01', `${path} のSHA-256付き転送データを作成します（${data.byteLength} byte）。`);
       const payload = await buildFileSavePayload(path, data);
@@ -396,7 +396,7 @@ export class MaixPyIdeClient {
 
   async poll() {
     return this.#serialized(async () => {
-      if (!this.ideReady) throw new Error('UnitVがIDEモードではありません。');
+      if (!this.ideReady) throw new Error('UnitVが実機通信モードではありません。');
       const txLength = uint32(await this.#query(MAIXPY_COMMAND.TX_BUF_LEN, 4));
       if (txLength > 4 * 1024 * 1024) throw new Error('UnitVの出力バッファが上限を超えました。');
       const stdout = txLength ? await this.#query(MAIXPY_COMMAND.TX_BUF, txLength, 5000) : new Uint8Array();
@@ -424,3 +424,7 @@ export class MaixPyIdeClient {
     await this.transport.close();
   }
 }
+
+// Public product-facing name. Keep MaixPyIdeClient as a compatibility export
+// because the wire protocol is the MaixPy IDE protocol used by UnitV firmware.
+export const UnitVDeviceClient = MaixPyIdeClient;

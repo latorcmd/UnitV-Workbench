@@ -1,6 +1,6 @@
 {
-  "name": "UnitV Browser Lab",
-  "short_name": "UnitV Lab",
+  "name": "UnitV Workbench",
+  "short_name": "UnitV WB",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#071017",

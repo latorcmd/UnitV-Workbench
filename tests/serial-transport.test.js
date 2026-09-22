@@ -68,6 +68,6 @@ test('turns Chrome open failures into an actionable COM-port message', async () 
   });
   await assert.rejects(
     transport.requestAndOpen(115200),
-    /選択したM5Stackポートを使っているシリアルモニタやMaixPy IDEを閉じ/
+    /選択したM5StackポートでUnitVと通信している他のアプリを閉じ/
   );
 });

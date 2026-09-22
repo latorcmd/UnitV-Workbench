@@ -28,7 +28,7 @@ test('rejects newer kmodel formats with an actionable message', () => {
   assert.throws(() => inspectKmodel(model), /v3のみ対応/);
 });
 
-test('decodes MaixPy YOLO2 output into UnitV-style detections', () => {
+test('decodes YOLO2 output into UnitV-style detections', () => {
   const output = new Float32Array([0, 0, 0, 0, 10, 10, 0, 0]);
   const detections = decodeYolo2(output, { width:1, height:1, channels:8, inputWidth:100, inputHeight:100 }, {
     anchors:[1, 1], anchorCount:1, threshold:.2, nmsThreshold:.4, imageWidth:100, imageHeight:100
