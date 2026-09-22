@@ -136,6 +136,27 @@ test('stalled boot output triggers another automatic recovery cycle', async () =
   assert.match(traces.find(trace => trace.step === 'IDE-02B.2').message, /boot stalled/);
 });
 
+test('camera probe stall waits without repeatedly resetting the UnitV', async () => {
+  const transport = new MockTransport();
+  let cameraLogReturned = false;
+  transport.takeBuffered = () => {
+    if (cameraLogReturned) return new Uint8Array();
+    cameraLogReturned = true;
+    return new TextEncoder().encode('[MAIXPY]: find ov7740\r\n');
+  };
+  const traces = [];
+  const client = new MaixPyIdeClient(transport, {
+    onTrace:trace => traces.push(trace),
+    replInitialTimeoutMs:1,
+    replRecoveryTimeoutMs:1,
+    replRecoveryAttempts:3,
+    sensorProbeTimeoutMs:1
+  });
+  await assert.rejects(client.activateIde(), /カメラ検出（ov7740）/);
+  assert.deepEqual(transport.reopens, []);
+  assert.match(traces.find(trace => trace.step === 'IDE-02S').message, /再起動せず/);
+});
+
 test('IDE mode stays at the open console baud rate on Windows Web Serial', async () => {
   assert.equal(MAIXPY_IDE_BAUD, MAIXPY_CONSOLE_BAUD);
   const transport = new MockTransport([le32(MAIXPY_STATUS_MAGIC)]);
@@ -149,10 +170,10 @@ test('IDE mode stays at the open console baud rate on Windows Web Serial', async
   assert.match(bootstrap, /except TypeError:/);
   assert.equal(bootstrap.charCodeAt(bootstrap.length - 1), 0x04);
   assert.equal(client.ideReady, true);
-  assert.equal(transport.writes.filter(packet => packet[0] === 0x03 && packet[1] === 0x03 && packet[2] === 0x02).length, 3);
-  assert.match(traces.find(trace => trace.step === 'IDE-02R').message, /3回/);
+  assert.equal(transport.writes.filter(packet => packet[0] === 0x03 && packet[1] === 0x03 && packet[2] === 0x02).length, 2);
+  assert.match(traces.find(trace => trace.step === 'IDE-02R').message, /2回/);
   assert.deepEqual(traces.map(trace => trace.step), [
-    'IDE-01', 'IDE-02', 'IDE-02R', 'IDE-03', 'IDE-03R', 'IDE-04', 'IDE-04R', 'IDE-05', 'IDE-06'
+    'IDE-01', 'IDE-02', 'IDE-02S', 'IDE-02R', 'IDE-03', 'IDE-03R', 'IDE-04', 'IDE-04R', 'IDE-05', 'IDE-06'
   ]);
 });
 

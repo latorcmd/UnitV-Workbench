@@ -29,6 +29,7 @@ import {
 const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_TEXT_BYTES = 1024 * 1024;
 const EXECUTION_LIMIT_MS = 8000;
+const APP_VERSION = '0.3.31';
 const initialTheme = localStorage.getItem('unitv-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
 document.documentElement.dataset.theme = initialTheme;
 
@@ -37,7 +38,7 @@ document.querySelector('#app').innerHTML = `
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
-        <div><h1>UnitV Browser Lab</h1><p>MaixPyを、ブラウザで試す。</p></div>
+        <div><h1>UnitV Browser Lab <small class="app-version">v${APP_VERSION}</small></h1><p>MaixPyを、ブラウザで試す。</p></div>
       </div>
       <div class="top-actions">
         <span class="privacy-pill"><span></span>画像・コードは端末内で処理</span>
@@ -160,7 +161,7 @@ document.querySelector('#app').innerHTML = `
 
   <dialog id="license-dialog" class="dialog license-dialog">
     <form method="dialog"><div class="dialog-head"><div><span class="panel-kicker">OPEN SOURCE</span><h2>ライセンス</h2></div><button value="close" aria-label="閉じる">×</button></div>
-      <p class="dialog-intro">UnitV Browser Labの自作部分はMIT Licenseで公開します。ブラウザへ同梱している主なOSSは次のとおりです。完全な一覧と表記はリポジトリの <code>LICENSE</code> と <code>THIRD_PARTY_NOTICES.md</code> にあります。</p>
+      <p class="dialog-intro"><strong>UnitV Browser Lab v${APP_VERSION}</strong> の自作部分はMIT Licenseで公開します。ブラウザへ同梱している主なOSSは次のとおりです。完全な一覧と表記はリポジトリの <code>LICENSE</code> と <code>THIRD_PARTY_NOTICES.md</code> にあります。</p>
       <div class="license-list">
         <a href="https://github.com/pyodide/pyodide" target="_blank" rel="noreferrer"><strong>Pyodide 0.28.3</strong><span>Mozilla Public License 2.0</span></a>
         <a href="https://github.com/astral-sh/ruff" target="_blank" rel="noreferrer"><strong>Ruff WASM 0.16.1</strong><span>MIT License</span></a>

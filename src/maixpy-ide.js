@@ -21,7 +21,7 @@ export const MAIXPY_CONSOLE_BAUD = 115_200;
 // but substantially more reliable for browser use.
 export const MAIXPY_IDE_BAUD = MAIXPY_CONSOLE_BAUD;
 export const MAIXPY_STATUS_MAGIC = 0xffeebbaa;
-export const MAIXPY_DIAGNOSTIC_VERSION = 8;
+export const MAIXPY_DIAGNOSTIC_VERSION = 9;
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
@@ -89,7 +89,7 @@ const FILE_SAVE_ERRORS = Object.freeze({
 });
 
 export class MaixPyIdeClient {
-  constructor(transport, { onTrace = () => {}, replInitialTimeoutMs = 10_000, replRecoveryTimeoutMs = 12_000, replRecoveryAttempts = 3 } = {}) {
+  constructor(transport, { onTrace = () => {}, replInitialTimeoutMs = 10_000, replRecoveryTimeoutMs = 12_000, replRecoveryAttempts = 3, sensorProbeTimeoutMs = 75_000 } = {}) {
     this.transport = transport;
     this.queue = Promise.resolve();
     this.ideReady = false;
@@ -97,6 +97,7 @@ export class MaixPyIdeClient {
     this.replInitialTimeoutMs = replInitialTimeoutMs;
     this.replRecoveryTimeoutMs = replRecoveryTimeoutMs;
     this.replRecoveryAttempts = replRecoveryAttempts;
+    this.sensorProbeTimeoutMs = sensorProbeTimeoutMs;
   }
 
   #trace(step, message, level = 'debug') {
@@ -125,21 +126,33 @@ export class MaixPyIdeClient {
     }
     const received = [];
     const startedAt = Date.now();
-    const deadline = Date.now() + timeoutMs;
+    let deadline = Date.now() + timeoutMs;
     let nextProgressAt = startedAt + 5_000;
+    let nextInterruptAt = 0;
+    let cameraProbe = '';
     let attempts = 0;
     while (Date.now() < deadline) {
       throwIfAborted(signal);
-      attempts += 1;
-      if (raw) await this.transport.write(new Uint8Array([0x01]));
-      else await this.transport.write(new Uint8Array([0x03, 0x03, 0x02]));
-      await delay(raw ? 220 : 700);
+      if (raw || !cameraProbe || Date.now() >= nextInterruptAt) {
+        attempts += 1;
+        if (raw) await this.transport.write(new Uint8Array([0x01]));
+        else await this.transport.write(new Uint8Array([0x03, 0x03, 0x02]));
+        nextInterruptAt = Date.now() + 2_000;
+      }
+      await delay(raw ? 220 : cameraProbe ? 500 : 700);
       throwIfAborted(signal);
       const chunk = this.transport.takeBuffered(4096);
       for (const byte of chunk) if (received.length < 8192) received.push(byte);
       const bytes = new Uint8Array(received);
       const text = new TextDecoder().decode(bytes);
       if (raw ? text.includes('raw REPL') : text.includes('>>>')) return { bytes, attempts };
+      const detectedCamera = !raw && !cameraProbe ? text.match(/\[MAIXPY\]:\s*find\s+([^\r\n]+)/i)?.[1]?.trim() : '';
+      if (detectedCamera) {
+        cameraProbe = detectedCamera;
+        deadline = Math.max(deadline, Date.now() + this.sensorProbeTimeoutMs);
+        nextProgressAt = Date.now() + 5_000;
+        this.#trace('IDE-02S', `UnitVファームウェアがカメラ ${cameraProbe} を検出中です。再起動せず最大${Math.round(this.sensorProbeTimeoutMs / 1000)}秒待機します。`, 'warning');
+      }
       if (!raw && Date.now() >= nextProgressAt) {
         const seconds = Math.round((Date.now() - startedAt) / 1000);
         this.#trace(progressStep, `REPL応答を待機中です（${seconds}秒、割り込み送信 ${attempts}回、${receivedPreview(bytes)}）。`);
@@ -151,6 +164,8 @@ export class MaixPyIdeClient {
     const error = new Error(`${mode}のプロンプトを確認できませんでした（${receivedPreview(bytes)}）。`);
     error.receivedBytes = bytes;
     error.attempts = attempts;
+    error.cameraProbeStalled = Boolean(cameraProbe);
+    error.cameraProbe = cameraProbe;
     throw error;
   }
 
@@ -215,6 +230,10 @@ export class MaixPyIdeClient {
           friendlyReply = await this.#waitForReplPrompt({ timeoutMs:this.replInitialTimeoutMs, signal });
         } catch (error) {
           if (error?.name === 'AbortError') throw error;
+          if (error?.cameraProbeStalled) {
+            stage = 'IDE-02S';
+            throw new Error(`UnitVの起動がカメラ検出（${error.cameraProbe}）で停止しました。USBを完全に抜いて電源を切り、カメラのフラットケーブルを挿し直してから再接続してください。`, { cause:error });
+          }
           let lastError = error;
           for (let recoveryAttempt = 1; recoveryAttempt <= this.replRecoveryAttempts; recoveryAttempt += 1) {
             stage = `IDE-02C.${recoveryAttempt}`;
@@ -233,6 +252,10 @@ export class MaixPyIdeClient {
               break;
             } catch (recoveryError) {
               if (recoveryError?.name === 'AbortError') throw recoveryError;
+              if (recoveryError?.cameraProbeStalled) {
+                stage = 'IDE-02S';
+                throw new Error(`UnitVの起動がカメラ検出（${recoveryError.cameraProbe}）で停止しました。USBを完全に抜いて電源を切り、カメラのフラットケーブルを挿し直してから再接続してください。`, { cause:recoveryError });
+              }
               lastError = recoveryError;
             }
           }
